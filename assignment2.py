@@ -1,6 +1,6 @@
 # Assignment 2: Deep Learning-based Brain Tumor Segmentation Using MRI
 # Name: Zachary Wood
-# Date: 3/12/2025
+# Date: 3/12/2025 (Recent Modifications have broken this. V3 aims to fix this.)
 
 # Data Details:
 # imagesTr is the folder containing the training samples
@@ -69,6 +69,9 @@ from monai.losses import DiceLoss as DiceCELoss
 from monai.data import Dataset as MonaiDataset
 from monai.networks.nets import UNet as MonaiUNet
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
+import nibabel as nib
+import random
+from medpy.metric.binary import hd95
 
 # Set random seed for reproducibility
 np.random.seed(42)
@@ -77,6 +80,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
     # Enable benchmark mode for faster training
     torch.backends.cudnn.benchmark = True
+    # For numerical stability
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,11 +256,12 @@ class BrainTumorDataset(Dataset):
                     continue
                 
                 # Debug: Check for enhancing tumor in this volume
-                has_et = torch.any(lbl_volume == 4).item()
+                # IMPORTANT: In BraTS dataset, enhancing tumor is label 3 (not 4)
+                has_et = torch.any(lbl_volume == 3).item()
                 if has_et and i < 5:  # Only print for first few volumes
-                    print(f"Volume {i} contains enhancing tumor (label 4)")
+                    print(f"Volume {i} contains enhancing tumor (label 3)")
                     # Count how many voxels have enhancing tumor
-                    et_voxels = torch.sum(lbl_volume == 4).item()
+                    et_voxels = torch.sum(lbl_volume == 3).item()
                     total_voxels = lbl_volume.numel()
                     print(f"  - ET voxels: {et_voxels} ({100 * et_voxels / total_voxels:.4f}% of volume)")
                 
@@ -275,10 +282,15 @@ class BrainTumorDataset(Dataset):
                     
                     volume_slices += 1
                     
-                    # Check for enhancing tumor in this slice
-                    has_et_slice = torch.any(lbl_slice == 4).item()
+                    # Check for enhancing tumor in this slice (label 3)
+                    has_et_slice = torch.any(lbl_slice == 3).item()
                     if has_et_slice:
                         volume_et_slices += 1
+                        # Print details for first few ET slices
+                        if et_slices < 5:
+                            et_pixels = torch.sum(lbl_slice == 3).item()
+                            total_pixels = lbl_slice.numel()
+                            print(f"Found ET slice in volume {i}, slice {z}: {et_pixels} pixels ({100 * et_pixels / total_pixels:.4f}%)")
                     
                     # Skip slices without any tumor
                     has_tumor = torch.sum(lbl_slice > 0).item() >= 10
@@ -321,6 +333,13 @@ class BrainTumorDataset(Dataset):
             for i in range(min(3, len(self.all_slices))):
                 img, lbl, idx = self.all_slices[i]
                 print(f"Slice {i} - Image shape: {img.shape}, Label shape: {lbl.shape}, Slice index: {idx}")
+                # Print label distribution
+                unique_labels = torch.unique(lbl)
+                print(f"  - Unique labels: {unique_labels}")
+                for label_val in unique_labels:
+                    count = (lbl == label_val).sum().item()
+                    percentage = 100 * count / lbl.numel()
+                    print(f"  - Label {label_val.item()}: {count} pixels ({percentage:.4f}%)")
             print("================================")
     
     def _resize_slice(self, slice_tensor, target_size):
@@ -418,22 +437,22 @@ class BrainTumorDataset(Dataset):
                 print(f"Warning: Label is not a tensor at index {idx}")
                 label = torch.zeros((1, *self.target_size), dtype=torch.float32)
             
-            # Debug: Check for enhancing tumor in this slice
-            has_et = torch.any(label == 4).item()
+            # Debug: Check for enhancing tumor in this slice (label 3)
+            has_et = torch.any(label == 3).item()
             if has_et and idx < 10:  # Only print for first few slices
-                et_pixels = torch.sum(label == 4).item()
+                et_pixels = torch.sum(label == 3).item()
                 total_pixels = label.numel()
-                print(f"Slice {idx} contains enhancing tumor (label 4): {et_pixels} pixels ({100 * et_pixels / total_pixels:.4f}%)")
+                print(f"Slice {idx} contains enhancing tumor (label 3): {et_pixels} pixels ({100 * et_pixels / total_pixels:.4f}%)")
             
             # Create one-hot encoding for segmentation
-            # Convert label to one-hot encoding: background (0), necrotic (1), edema (2), enhancing (4)
+            # Convert label to one-hot encoding: background (0), necrotic (1), edema (2), enhancing (3)
             one_hot = torch.zeros((4, *label.shape[1:]), dtype=torch.float32)
             
-            # Extract specific classes
+            # Extract specific classes - IMPORTANT: BraTS uses labels 0,1,2,3 (not 4)
             one_hot[0] = (label[0] == 0).float()  # Background
             one_hot[1] = (label[0] == 1).float()  # Necrotic and non-enhancing tumor
             one_hot[2] = (label[0] == 2).float()  # Peritumoral edema
-            one_hot[3] = (label[0] == 4).float()  # GD-enhancing tumor
+            one_hot[3] = (label[0] == 3).float()  # GD-enhancing tumor
             
             # Debug: Check if one-hot encoding preserved enhancing tumor
             if has_et and idx < 10:
@@ -473,6 +492,17 @@ class BrainTumorDataset(Dataset):
                     new_one_hot[:, start_x:start_x+one_hot.shape[1], start_y:start_y+one_hot.shape[2]] = one_hot
                     one_hot = new_one_hot
             
+            # Verify one-hot encoding is valid (sums to 1 across channels)
+            sum_channels = one_hot.sum(dim=0)
+            if not torch.all(sum_channels <= 1.0001) or not torch.all(sum_channels >= 0.9999):
+                print(f"Warning: One-hot encoding is invalid at index {idx}. Sum across channels: min={sum_channels.min().item()}, max={sum_channels.max().item()}")
+                # Fix one-hot encoding
+                max_indices = torch.argmax(one_hot, dim=0)
+                fixed_one_hot = torch.zeros_like(one_hot)
+                for c in range(one_hot.shape[0]):
+                    fixed_one_hot[c] = (max_indices == c).float()
+                one_hot = fixed_one_hot
+            
             return image, one_hot, slice_idx
             
         except Exception as e:
@@ -496,276 +526,134 @@ def dice_score(pred, target, smooth=1e-6):
 # Function to calculate Hausdorff distance using MONAI's implementation
 def hausdorff_distance(pred, target):
     """
-    Calculate the 95% Hausdorff Distance using MONAI's implementation.
+    Compute the 95% Hausdorff Distance using medpy implementation.
     
-    Parameters:
-    -----------
-    pred : torch.Tensor
-        Prediction binary mask
-    target : torch.Tensor
-        Ground truth binary mask
-        
+    Args:
+        pred (torch.Tensor): Prediction tensor (binary)
+        target (torch.Tensor): Target tensor (binary)
+    
     Returns:
-    --------
-    float
-        The 95% Hausdorff distance
+        float: 95% Hausdorff distance
     """
-    # Ensure inputs are on CPU and in correct format
-    pred = pred.unsqueeze(0).unsqueeze(0).cpu()  # Add batch and channel dimensions
-    target = target.unsqueeze(0).unsqueeze(0).cpu()
+    # Convert tensors to numpy arrays
+    pred_np = pred.cpu().numpy().astype(bool)
+    target_np = target.cpu().numpy().astype(bool)
+    
+    # Check if either array is empty (no positive pixels)
+    if not np.any(pred_np) or not np.any(target_np):
+        return float('nan')
     
     try:
-        hd = compute_hausdorff_distance(pred, target, percentile=95)
-        return hd.item()
+        return hd95(pred_np, target_np)
     except Exception as e:
-        print(f"Error calculating Hausdorff distance: {e}")
-        return 150.0  # Return high value on error
+        print(f"Error computing Hausdorff distance: {e}")
+        return float('nan')
 
 # Function to train the model
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, checkpoint_path):
+def train_model(model, train_loader, val_loader, criterion, optimizer, device, num_epochs=10, checkpoint_dir='checkpoints'):
     """
     Train the model.
     
-    Parameters:
-    -----------
-    model : nn.Module
-        The model to train
-    train_loader : DataLoader
-        DataLoader for training data
-    val_loader : DataLoader
-        DataLoader for validation data
-    criterion : nn.Module
-        Loss function
-    optimizer : torch.optim.Optimizer
-        Optimizer
-    scheduler : torch.optim.lr_scheduler
-        Learning rate scheduler
-    num_epochs : int
-        Number of epochs to train for
-    checkpoint_path : str
-        Path to save the best model checkpoint
-        
+    Args:
+        model: The neural network model
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        criterion: Loss function
+        optimizer: Optimizer
+        device: Device to run training on
+        num_epochs: Number of epochs to train for
+        checkpoint_dir: Directory to save checkpoints
+    
     Returns:
-    --------
-    tuple
-        (train_losses, val_losses)
+        model: The trained model
+        history: Training history
     """
-    # Check if loaders have data
-    if len(train_loader) == 0:
-        raise ValueError("Training data loader is empty. Cannot train the model.")
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
-    if len(val_loader) == 0:
-        raise ValueError("Validation data loader is empty. Cannot validate the model.")
-    
-    # Ensure checkpoint directory exists
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-    
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
-    current_lr = optimizer.param_groups[0]['lr']
-    patience = 10  # Early stopping patience
-    patience_counter = 0
-    
-    # Initialize gradient scaler for mixed precision training with explicit enabled=True
-    scaler = torch.amp.GradScaler(enabled=True) if torch.cuda.is_available() else None
-    
-    # Set gradient clipping threshold
-    max_grad_norm = 1.0
-    
-    # Track NaN occurrences
-    nan_count = 0
-    max_nan_tolerance = 5
-    
-    # Save initial model as a fallback
-    initial_checkpoint = {
-        'epoch': -1,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': float('inf')
+    # Initialize history dictionary
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_dice': [],
+        'val_hausdorff': []
     }
-    torch.save(initial_checkpoint, checkpoint_path.replace('.pth', '_initial.pth'))
     
+    # Initialize best validation metrics
+    best_val_loss = float('inf')
+    
+    # Training loop
     for epoch in range(num_epochs):
         # Training phase
         model.train()
-        epoch_train_loss = 0
-        batch_count = 0
+        train_loss = 0.0
         
-        for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Training'):
-            # Unpack the batch - handle different formats
-            if isinstance(batch, (list, tuple)) and len(batch) >= 3:
-                images, labels, _ = batch  # Ignoring the index
-            elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                images, labels = batch[:2]  # Take first two elements
-            else:
-                print(f"Warning: Unexpected batch format: {type(batch)}")
-                continue
+        # Use tqdm for progress bar
+        with tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}') as pbar:
+            for batch in pbar:
+                # Get data
+                images, labels = batch
+                images, labels = images.to(device), labels.to(device)
                 
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            # Zero the gradients
-            optimizer.zero_grad()
-            
-            try:
-                # Mixed precision training with explicit dtype
-                if scaler is not None:
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                        outputs = model(images)
-                        loss = criterion(outputs, labels)
-                        
-                        # Check for NaN loss
-                        if torch.isnan(loss).item() or torch.isinf(loss).item():
-                            print(f"\nWARNING: NaN or Inf loss detected in batch. Skipping batch.")
-                            nan_count += 1
-                            if nan_count > max_nan_tolerance:
-                                print(f"Too many NaN losses ({nan_count}). Stopping training.")
-                                # Load the initial model as fallback
-                                checkpoint = torch.load(checkpoint_path.replace('.pth', '_initial.pth'))
-                                model.load_state_dict(checkpoint['model_state_dict'])
-                                return train_losses, val_losses
-                            continue
-                    
-                    # Backward pass with gradient scaling
-                    scaler.scale(loss).backward()
-                    
-                    # Gradient clipping
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    
-                    # Optimizer step with gradient scaling
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    # Regular training
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                    
-                    # Check for NaN loss
-                    if torch.isnan(loss).item() or torch.isinf(loss).item():
-                        print(f"\nWARNING: NaN or Inf loss detected in batch. Skipping batch.")
-                        nan_count += 1
-                        if nan_count > max_nan_tolerance:
-                            print(f"Too many NaN losses ({nan_count}). Stopping training.")
-                            # Load the initial model as fallback
-                            checkpoint = torch.load(checkpoint_path.replace('.pth', '_initial.pth'))
-                            model.load_state_dict(checkpoint['model_state_dict'])
-                            return train_losses, val_losses
-                        continue
-                    
-                    loss.backward()
-                    
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    
-                    optimizer.step()
+                # Check for NaN values
+                if torch.isnan(images).any() or torch.isnan(labels).any():
+                    print("Warning: NaN values detected in input data. Skipping batch.")
+                    continue
                 
-                # Update counters
-                batch_loss = loss.item()
-                if not np.isnan(batch_loss) and not np.isinf(batch_loss):
-                    epoch_train_loss += batch_loss
-                    batch_count += 1
-            
-            except Exception as e:
-                print(f"Error during training batch: {e}")
-                continue
-            
-            # Monitor memory usage and adjust batch size if needed
-            if torch.cuda.is_available():
-                memory_allocated = torch.cuda.memory_allocated() / 1024**2  # Convert to MB
-                if memory_allocated > torch.cuda.get_device_properties(0).total_memory * 0.95 / 1024**2:
-                    print("\nWARNING: High memory usage detected. Consider reducing batch size.")
+                # Forward pass
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                
+                # Check for NaN loss
+                if torch.isnan(loss):
+                    print("Warning: NaN loss detected. Skipping batch.")
+                    continue
+                
+                # Backward pass and optimize
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                # Update statistics
+                train_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
         
-        # Calculate average training loss for this epoch
-        epoch_train_loss = epoch_train_loss / max(1, batch_count)  # Avoid division by zero
-        train_losses.append(epoch_train_loss)
+        # Calculate average training loss
+        avg_train_loss = train_loss / len(train_loader)
+        history['train_loss'].append(avg_train_loss)
         
         # Validation phase
-        model.eval()
-        epoch_val_loss = 0
-        val_batch_count = 0
+        val_metrics = evaluate_model(model, val_loader, device, criterion)
         
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Validation'):
-                # Unpack the batch - handle different formats
-                if isinstance(batch, (list, tuple)) and len(batch) >= 3:
-                    images, labels, _ = batch  # Ignoring the index
-                elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                    images, labels = batch[:2]  # Take first two elements
-                else:
-                    print(f"Warning: Unexpected batch format: {type(batch)}")
-                    continue
-                
-                images = images.to(device)
-                labels = labels.to(device)
-                
-                try:
-                    # Forward pass
-                    if scaler is not None:
-                        with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-                            outputs = model(images)
-                            loss = criterion(outputs, labels)
-                    else:
-                        outputs = model(images)
-                        loss = criterion(outputs, labels)
-                    
-                    # Update counters
-                    batch_loss = loss.item()
-                    if not np.isnan(batch_loss) and not np.isinf(batch_loss):
-                        epoch_val_loss += batch_loss
-                        val_batch_count += 1
-                except Exception as e:
-                    print(f"Error during validation batch: {e}")
-                    continue
-        
-        # Calculate average validation loss for this epoch
-        epoch_val_loss = epoch_val_loss / max(1, val_batch_count)  # Avoid division by zero
-        val_losses.append(epoch_val_loss)
-        
-        # Update learning rate based on validation loss
-        prev_lr = current_lr
-        scheduler.step(epoch_val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # Print learning rate change if it occurred
-        if current_lr != prev_lr:
-            print(f"Learning rate changed from {prev_lr:.6f} to {current_lr:.6f}")
+        # Update history
+        history['val_loss'].append(val_metrics['loss'])
+        history['val_dice'].append(val_metrics['dice'])
+        history['val_hausdorff'].append(val_metrics['hausdorff'])
         
         # Print epoch results
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}, LR: {current_lr:.6f}')
+        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f'  Train Loss: {avg_train_loss:.4f}')
+        print(f'  Val Loss: {val_metrics["loss"]:.4f}')
+        print(f'  Val Dice: {val_metrics["dice"]:.4f}')
+        print(f'  Val Hausdorff: {val_metrics["hausdorff"]:.4f}')
         
-        # Early stopping check
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            patience_counter = 0
-            checkpoint = {
-                'epoch': epoch,
+        # Save checkpoint if validation loss improved
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            checkpoint_path = os.path.join(checkpoint_dir, f'model_epoch_{epoch+1}.pt')
+            torch.save({
+                'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'best_val_loss': best_val_loss
-            }
-            torch.save(checkpoint, checkpoint_path)
-            print(f'Checkpoint saved at epoch {epoch+1} with validation loss {best_val_loss:.4f}')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'\nEarly stopping triggered after {epoch+1} epochs')
-                break
+                'loss': best_val_loss,
+            }, checkpoint_path)
+            print(f'  Checkpoint saved to {checkpoint_path}')
     
-    # Load the best model
-    try:
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded best model from epoch {checkpoint['epoch']+1} with validation loss {checkpoint['best_val_loss']:.4f}")
-    except Exception as e:
-        print(f"Error loading best model: {e}. Using current model state.")
-    
-    return train_losses, val_losses
+    return model, history
 
 # Function to plot training and validation losses
 def plot_losses(train_losses, val_losses, fold):
@@ -781,195 +669,84 @@ def plot_losses(train_losses, val_losses, fold):
     plt.close()
 
 # Function to evaluate the model
-def evaluate_model(model, test_loader):
+def evaluate_model(model, dataloader, device, criterion):
+    """
+    Evaluate the model on the validation set.
+    
+    Args:
+        model: The neural network model
+        dataloader: DataLoader for validation data
+        device: Device to run evaluation on
+        criterion: Loss function
+    
+    Returns:
+        dict: Dictionary containing evaluation metrics
+    """
     model.eval()
+    total_loss = 0.0
+    dice_scores = []
+    hausdorff_distances = []
     
-    # Initialize MONAI metrics
-    dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=True)
-    hausdorff_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95, get_not_nans=True)
-    
-    # Store some examples for visualization
-    examples = []
-    
-    # Initialize metric accumulators
-    all_metrics = {
-        'dice_et': [],
-        'dice_tc': [],
-        'dice_wt': [],
-        'hd95_et': [],
-        'hd95_tc': [],
-        'hd95_wt': []
-    }
-    
-    # Add debugging counters
-    debug_stats = {
-        'total_slices': 0,
-        'slices_with_et_gt': 0,
-        'slices_with_tc_gt': 0,
-        'slices_with_wt_gt': 0,
-        'slices_with_et_pred': 0,
-        'slices_with_tc_pred': 0,
-        'slices_with_wt_pred': 0,
-    }
+    # Counters for debugging
+    total_samples = 0
+    empty_gt_samples = 0
+    empty_pred_samples = 0
     
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc='Evaluating'):
-            # Unpack the batch - handle different formats
-            if isinstance(batch, (list, tuple)) and len(batch) >= 3:
-                images, labels, slice_idx = batch
-            elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                images, labels = batch[:2]
-                slice_idx = torch.zeros(images.size(0))  # Dummy indices
-            else:
-                print(f"Warning: Unexpected batch format: {type(batch)}")
-                continue
-                
-            images = images.to(device)
-            labels = labels.to(device)
+        for batch in dataloader:
+            images, labels = batch
+            images, labels = images.to(device), labels.to(device)
             
-            # Forward pass
             outputs = model(images)
-            outputs = torch.softmax(outputs, dim=1)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
             
-            # Debug: Print output statistics for first batch
-            if debug_stats['total_slices'] == 0:
-                print("\n===== MODEL OUTPUT DEBUG =====")
-                print(f"Output shape: {outputs.shape}")
-                print(f"Output min: {outputs.min().item()}, max: {outputs.max().item()}")
-                print(f"Output class distribution:")
-                for c in range(outputs.shape[1]):
-                    print(f"  Class {c}: {torch.argmax(outputs, dim=1).eq(c).float().mean().item()*100:.2f}%")
-                print("=============================\n")
-                
-                # Debug: Print label statistics for first batch
-                print("\n===== LABEL DEBUG =====")
-                print(f"Label shape: {labels.shape}")
-                print(f"Label min: {labels.min().item()}, max: {labels.max().item()}")
-                print(f"Label class distribution:")
-                for c in range(labels.shape[1]):
-                    print(f"  Class {c}: {(labels[:, c] > 0.5).float().mean().item()*100:.2f}%")
-                print("=======================\n")
+            # Convert outputs to binary predictions
+            preds = torch.argmax(outputs, dim=1)
             
-            # Store a few examples for visualization
-            if len(examples) < 5:
-                examples.append((images.cpu(), labels.cpu(), torch.argmax(outputs, dim=1).cpu(), slice_idx))
-            
-            # Process each sample in the batch
-            for i in range(images.size(0)):
-                debug_stats['total_slices'] += 1
-                
-                # Extract individual predictions and labels
-                pred = outputs[i:i+1]  # Keep batch dimension
-                label = labels[i:i+1]  # Keep batch dimension
-                
-                # Create binary masks for each region
-                # Enhancing tumor (ET) - label 4
-                pred_et = (torch.argmax(pred, dim=1) == 3).float()
-                gt_et = (label[:, 3] > 0.5).float()
-                
-                # Tumor core (TC) - labels 1 and 4
-                pred_tc = ((torch.argmax(pred, dim=1) == 1) | (torch.argmax(pred, dim=1) == 3)).float()
-                gt_tc = ((label[:, 1] > 0.5) | (label[:, 3] > 0.5)).float()
-                
-                # Whole tumor (WT) - labels 1, 2, and 4
-                pred_wt = ((torch.argmax(pred, dim=1) > 0)).float()
-                gt_wt = ((label[:, 1:] > 0.5).sum(dim=1) > 0).float()
-                
-                # Update debug counters
-                if torch.any(gt_et):
-                    debug_stats['slices_with_et_gt'] += 1
-                if torch.any(gt_tc):
-                    debug_stats['slices_with_tc_gt'] += 1
-                if torch.any(gt_wt):
-                    debug_stats['slices_with_wt_gt'] += 1
-                if torch.any(pred_et):
-                    debug_stats['slices_with_et_pred'] += 1
-                if torch.any(pred_tc):
-                    debug_stats['slices_with_tc_pred'] += 1
-                if torch.any(pred_wt):
-                    debug_stats['slices_with_wt_pred'] += 1
-                
-                # Calculate metrics for each region
-                if torch.any(gt_et):
-                    dice_metric(pred_et.unsqueeze(1), gt_et.unsqueeze(1))
-                    hausdorff_metric(pred_et.unsqueeze(1), gt_et.unsqueeze(1))
+            # Calculate metrics for each class (excluding background)
+            for c in range(1, 4):  # Classes 1, 2, 3 (excluding background)
+                for i in range(preds.shape[0]):  # For each sample in batch
+                    pred_c = (preds[i] == c).float()
+                    label_c = (labels[i, c] == 1).float()
                     
-                    # Safely extract metric values
-                    dice_result = dice_metric.aggregate()
-                    if isinstance(dice_result, (int, float)) or (hasattr(dice_result, "item") and callable(getattr(dice_result, "item"))):
-                        all_metrics['dice_et'].append(dice_result.item() if hasattr(dice_result, "item") else dice_result)
+                    # Count samples
+                    total_samples += 1
+                    if not torch.any(label_c):
+                        empty_gt_samples += 1
+                        continue
                     
-                    hd_result = hausdorff_metric.aggregate()
-                    if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
-                        all_metrics['hd95_et'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
-                
-                if torch.any(gt_tc):
-                    dice_metric(pred_tc.unsqueeze(1), gt_tc.unsqueeze(1))
-                    hausdorff_metric(pred_tc.unsqueeze(1), gt_tc.unsqueeze(1))
+                    if not torch.any(pred_c):
+                        empty_pred_samples += 1
+                        continue
                     
-                    # Safely extract metric values
-                    dice_result = dice_metric.aggregate()
-                    if isinstance(dice_result, (int, float)) or (hasattr(dice_result, "item") and callable(getattr(dice_result, "item"))):
-                        all_metrics['dice_tc'].append(dice_result.item() if hasattr(dice_result, "item") else dice_result)
+                    # Calculate Dice score
+                    dice = dice_coefficient(pred_c, label_c)
+                    if not torch.isnan(dice):
+                        dice_scores.append(dice.item())
                     
-                    hd_result = hausdorff_metric.aggregate()
-                    if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
-                        all_metrics['hd95_tc'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
-                
-                if torch.any(gt_wt):
-                    dice_metric(pred_wt.unsqueeze(1), gt_wt.unsqueeze(1))
-                    hausdorff_metric(pred_wt.unsqueeze(1), gt_wt.unsqueeze(1))
-                    
-                    # Safely extract metric values
-                    dice_result = dice_metric.aggregate()
-                    if isinstance(dice_result, (int, float)) or (hasattr(dice_result, "item") and callable(getattr(dice_result, "item"))):
-                        all_metrics['dice_wt'].append(dice_result.item() if hasattr(dice_result, "item") else dice_result)
-                    
-                    hd_result = hausdorff_metric.aggregate()
-                    if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
-                        all_metrics['hd95_wt'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
+                    # Calculate Hausdorff distance
+                    hd = hausdorff_distance(pred_c, label_c)
+                    if not np.isnan(hd):
+                        hausdorff_distances.append(hd)
     
-    # Print debug statistics
-    print("\n===== EVALUATION DEBUG STATISTICS =====")
-    print(f"Total slices evaluated: {debug_stats['total_slices']}")
-    print(f"Ground truth statistics:")
-    print(f"  - Slices with ET: {debug_stats['slices_with_et_gt']} ({100*debug_stats['slices_with_et_gt']/max(1, debug_stats['total_slices']):.2f}%)")
-    print(f"  - Slices with TC: {debug_stats['slices_with_tc_gt']} ({100*debug_stats['slices_with_tc_gt']/max(1, debug_stats['total_slices']):.2f}%)")
-    print(f"  - Slices with WT: {debug_stats['slices_with_wt_gt']} ({100*debug_stats['slices_with_wt_gt']/max(1, debug_stats['total_slices']):.2f}%)")
-    print(f"Prediction statistics:")
-    print(f"  - Slices with ET predicted: {debug_stats['slices_with_et_pred']} ({100*debug_stats['slices_with_et_pred']/max(1, debug_stats['total_slices']):.2f}%)")
-    print(f"  - Slices with TC predicted: {debug_stats['slices_with_tc_pred']} ({100*debug_stats['slices_with_tc_pred']/max(1, debug_stats['total_slices']):.2f}%)")
-    print(f"  - Slices with WT predicted: {debug_stats['slices_with_wt_pred']} ({100*debug_stats['slices_with_wt_pred']/max(1, debug_stats['total_slices']):.2f}%)")
-    print("=====================================\n")
+    # Print debugging information
+    print(f"Total samples evaluated: {total_samples}")
+    print(f"Samples with empty ground truth: {empty_gt_samples}")
+    print(f"Samples with empty predictions: {empty_pred_samples}")
+    print(f"Valid dice scores: {len(dice_scores)}")
+    print(f"Valid Hausdorff distances: {len(hausdorff_distances)}")
     
-    # Calculate mean metrics
-    results = {
-        'dice_et': np.mean(all_metrics['dice_et']) if all_metrics['dice_et'] else 0,
-        'dice_tc': np.mean(all_metrics['dice_tc']) if all_metrics['dice_tc'] else 0,
-        'dice_wt': np.mean(all_metrics['dice_wt']) if all_metrics['dice_wt'] else 0,
-        'hd95_et': np.mean(all_metrics['hd95_et']) if all_metrics['hd95_et'] else 0,
-        'hd95_tc': np.mean(all_metrics['hd95_tc']) if all_metrics['hd95_tc'] else 0,
-        'hd95_wt': np.mean(all_metrics['hd95_wt']) if all_metrics['hd95_wt'] else 0
+    # Calculate average metrics
+    avg_loss = total_loss / len(dataloader)
+    avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+    avg_hd = np.mean(hausdorff_distances) if hausdorff_distances else float('inf')
+    
+    return {
+        'loss': avg_loss,
+        'dice': avg_dice,
+        'hausdorff': avg_hd
     }
-    
-    # Print detailed metrics
-    print("\n===== EVALUATION METRICS =====")
-    print(f"Enhancing Tumor (ET):")
-    print(f"  - Dice Score: {results['dice_et']:.4f}")
-    print(f"  - HD95: {results['hd95_et']:.4f}")
-    print(f"  - Number of valid samples: {len(all_metrics['dice_et'])}")
-    
-    print(f"\nTumor Core (TC):")
-    print(f"  - Dice Score: {results['dice_tc']:.4f}")
-    print(f"  - HD95: {results['hd95_tc']:.4f}")
-    print(f"  - Number of valid samples: {len(all_metrics['dice_tc'])}")
-    
-    print(f"\nWhole Tumor (WT):")
-    print(f"  - Dice Score: {results['dice_wt']:.4f}")
-    print(f"  - HD95: {results['hd95_wt']:.4f}")
-    print(f"  - Number of valid samples: {len(all_metrics['dice_wt'])}")
-    
-    return results, examples
 
 # Function to visualize results
 def visualize_results(examples, fold, output_dir):
@@ -1154,334 +931,160 @@ def analyze_dataset_et(data_loader):
 
 # Main function
 def main():
-    # Ask user if they want to train a new model or use a pre-trained model
-    while True:
-        choice = input("Do you want to train a new model or use a pre-trained model? (train/pretrained): ").strip().lower()
-        if choice in ['train', 'pretrained']:
-            break
-        print("Invalid choice. Please enter 'train' or 'pretrained'.")
+    """
+    Main function to run the brain tumor segmentation pipeline.
+    """
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Set hyperparameters - increased for RTX 4090
-    batch_size = 16  # Increased from 4 to 16
+    # Set hyperparameters
+    batch_size = 8
     num_epochs = 10
-    learning_rate = 0.001  # Increased from 0.0005 to 0.001
+    learning_rate = 0.0001
+    target_size = (128, 128)
     
-    # Define paths
-    data_dir = 'Task01_BrainTumour'
-    output_dir = 'results_v3'
+    # Set paths
+    data_dir = 'data'
+    checkpoint_dir = 'checkpoints'
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Create output directories
-    print(f"Creating output directories in {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.join(output_dir, 'visualizations'), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, 'checkpoints'), exist_ok=True)
+    # Create dataset
+    print("Creating dataset...")
+    train_dataset = BrainTumorDataset(
+        data_dir=data_dir,
+        transform=True,
+        train=True,
+        resize=True,
+        target_size=target_size,
+        visualize_samples=True
+    )
     
-    # Define directories
-    global images_dir, labels_dir
-    images_dir = os.path.join(data_dir, 'imagesTr')
-    labels_dir = os.path.join(data_dir, 'labelsTr')
+    val_dataset = BrainTumorDataset(
+        data_dir=data_dir,
+        transform=False,
+        train=False,
+        resize=True,
+        target_size=target_size
+    )
     
-    # Check if directories exist
-    if not os.path.exists(images_dir):
-        raise FileNotFoundError(f"Images directory not found: {images_dir}")
-    if not os.path.exists(labels_dir):
-        raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
     
-    # Get all image and label files (just the filenames, not full paths)
-    image_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.nii.gz') and not f.startswith('._')])
-    label_files = sorted([f for f in os.listdir(labels_dir) if f.endswith('.nii.gz') and not f.startswith('._')])
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
     
-    print(f"Found {len(image_files)} image files and {len(label_files)} label files")
+    # Check if data loaders have data
+    if len(train_loader) == 0:
+        print("Warning: Training data loader is empty.")
+        return
     
-    # Ensure matching files
-    valid_files = []
-    for img_file in image_files:
-        # Check if corresponding label file exists
-        if img_file in label_files:
-            valid_files.append(img_file)
+    if len(val_loader) == 0:
+        print("Warning: Validation data loader is empty.")
+        return
     
-    print(f"Found {len(valid_files)} valid image-label pairs")
+    # Create model
+    print("Creating model...")
+    model = UNet(in_channels=4, out_channels=4).to(device)
     
-    # Use valid_files for both images and labels
-    image_files = valid_files
-    label_files = valid_files
+    # Define loss function and optimizer
+    criterion = DiceCELoss(to_onehot_y=False, softmax=True)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
-    # Define 5-fold cross-validation
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    # Train or evaluate
+    print("Do you want to train or evaluate the model? (train/eval)")
+    choice = input().lower()
     
-    # Initialize results dictionary
-    results = {
-        'fold': [],
-        'dice_et': [],
-        'dice_tc': [],
-        'dice_wt': [],
-        'hd95_et': [],
-        'hd95_tc': [],
-        'hd95_wt': []
-    }
-    
-    # Loop through each fold
-    for fold, (train_idx, val_idx) in enumerate(kf.split(image_files)):
-        print(f"\nTraining fold {fold+1}/5")
-        
-        # Split data
-        train_img_files = [image_files[i] for i in train_idx]
-        train_label_files = [label_files[i] for i in train_idx]
-        val_img_files = [image_files[i] for i in val_idx]
-        val_label_files = [label_files[i] for i in val_idx]
-        
-        # Create datasets with transforms
-        try:
-            print("Creating training dataset...")
-            # Use higher resolution for RTX 4090
-            target_size = (240, 240)  # Increased from (128, 128)
-            train_dataset = BrainTumorDataset(train_img_files, train_label_files, transform=True, resize=True, target_size=target_size)
-            print("Training dataset created successfully")
-            
-            print("Creating validation dataset...")
-            val_dataset = BrainTumorDataset(val_img_files, val_label_files, transform=False, resize=True, target_size=target_size)
-            print("Validation dataset created successfully")
-            
-            # Check if datasets have data
-            if len(train_dataset) == 0:
-                print("ERROR: Training dataset is empty. Cannot proceed with training.")
-                continue
-            
-            if len(val_dataset) == 0:
-                print("ERROR: Validation dataset is empty. Cannot proceed with training.")
-                continue
-            
-            print(f"Training dataset size: {len(train_dataset)} slices")
-            print(f"Validation dataset size: {len(val_dataset)} slices")
-            
-            # Test loading a few samples to verify the dataset works
-            print("Testing dataset sample loading...")
-            for i in range(min(3, len(train_dataset))):
-                try:
-                    sample = train_dataset[i]
-                    print(f"Sample {i} loaded successfully. Image shape: {sample[0].shape}, Label shape: {sample[1].shape}")
-                except Exception as e:
-                    print(f"Error loading sample {i}: {e}")
-            
-            # Create data loaders with optimized settings for RTX 4090
-            print("Creating data loaders...")
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=batch_size, 
-                shuffle=True, 
-                num_workers=4,  # Increased from 0 to 4 for parallel loading
-                pin_memory=True  # Enabled pinned memory for faster transfers
-            )
-            
-            val_loader = DataLoader(
-                val_dataset, 
-                batch_size=batch_size, 
-                shuffle=False, 
-                num_workers=4,  # Increased from 0 to 4
-                pin_memory=True  # Enabled pinned memory
-            )
-            print("Data loaders created successfully")
-            
-            # Try to free up memory
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"Error creating datasets for fold {fold+1}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-        
-        # Analyze dataset for enhancing tumor regions
-        if fold == 0:  # Only do this for the first fold to save time
-            print("\nAnalyzing validation dataset for enhancing tumor regions...")
-            try:
-                et_prevalence = analyze_dataset_et(val_loader)
-                if et_prevalence < 0.05:
-                    print("\nWARNING: Very few enhancing tumor regions in the dataset.")
-                    print("This may lead to unreliable metrics for the enhancing tumor class.")
-            except Exception as e:
-                print(f"Error during dataset analysis: {e}")
-        
-        # Initialize model using MONAI's UNet with larger architecture for RTX 4090
-        model = MonaiUNet(
-            spatial_dims=2,
-            in_channels=4,
-            out_channels=4,
-            channels=(32, 64, 128, 256, 512),  # Larger architecture for RTX 4090
-            strides=(2, 2, 2, 2),
-            num_res_units=2,
-            norm='BATCH',
-            dropout=0.2,
-        ).to(device)
-        
-        # Initialize weights properly to prevent NaN issues
-        for m in model.modules():
-            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-        
-        # Use MONAI's DiceCELoss with optimized parameters
-        criterion = DiceCELoss(
-            to_onehot_y=False, 
-            softmax=True,
-            smooth_nr=1e-5,
-            smooth_dr=1e-5,
-            batch=True  # Enable batch processing
+    if choice == 'train':
+        # Train the model
+        print("Training model...")
+        model, history = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            num_epochs=num_epochs,
+            checkpoint_dir=checkpoint_dir
         )
         
-        # Define optimizer and scheduler with adjusted learning rate
-        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)  # Changed from Adam to AdamW
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            mode='min', 
-            factor=0.2,
-            patience=5,
-            min_lr=1e-6
-        )
+        # Plot training history
+        plt.figure(figsize=(12, 4))
         
-        # Define checkpoint path
-        checkpoint_path = os.path.join(output_dir, 'checkpoints', f'model_fold{fold+1}.pth')
+        plt.subplot(1, 3, 1)
+        plt.plot(history['train_loss'], label='Train')
+        plt.plot(history['val_loss'], label='Validation')
+        plt.title('Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
         
-        # Train or load model
-        try:
-            if choice == 'train':
-                # Train the model
-                train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, checkpoint_path)
-                
-                # Plot training and validation losses
-                plt.figure(figsize=(10, 5))
-                plt.plot(train_losses, label='Training Loss')
-                plt.plot(val_losses, label='Validation Loss')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.title(f'Training and Validation Losses - Fold {fold+1}')
-                plt.legend()
-                plt.savefig(os.path.join(output_dir, 'visualizations', f'loss_plot_fold{fold+1}.png'))
-                plt.close()
-            else:
-                # Load pre-trained model
-                if os.path.exists(checkpoint_path):
-                    checkpoint = torch.load(checkpoint_path)
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    print(f"Loaded pre-trained model from {checkpoint_path}")
-                else:
-                    print(f"No pre-trained model found at {checkpoint_path}. Training a new model.")
-                    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, checkpoint_path)
-            
-            # Evaluate the model
-            metrics, examples = evaluate_model(model, val_loader)
-            
-            # Store results
-            results['fold'].append(fold+1)
-            results['dice_et'].append(metrics['dice_et'])
-            results['dice_tc'].append(metrics['dice_tc'])
-            results['dice_wt'].append(metrics['dice_wt'])
-            results['hd95_et'].append(metrics['hd95_et'])
-            results['hd95_tc'].append(metrics['hd95_tc'])
-            results['hd95_wt'].append(metrics['hd95_wt'])
-            
-            # Visualize results
-            visualize_results(examples, fold, output_dir)
-            
-            # Print results for this fold
-            print(f"\nResults for fold {fold+1}:")
-            print(f"Dice ET: {metrics['dice_et']:.4f}")
-            print(f"Dice TC: {metrics['dice_tc']:.4f}")
-            print(f"Dice WT: {metrics['dice_wt']:.4f}")
-            print(f"HD95 ET: {metrics['hd95_et']:.4f}")
-            print(f"HD95 TC: {metrics['hd95_tc']:.4f}")
-            print(f"HD95 WT: {metrics['hd95_wt']:.4f}")
-            
-            # Try to free up memory again
-            del model, optimizer, scheduler, train_loader, val_loader, train_dataset, val_dataset
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"Error during training/evaluation for fold {fold+1}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    # Calculate average metrics
-    if results['fold']:  # Only if we have results
-        avg_dice_et = np.mean(results['dice_et'])
-        avg_dice_tc = np.mean(results['dice_tc'])
-        avg_dice_wt = np.mean(results['dice_wt'])
-        avg_hd95_et = np.mean(results['hd95_et'])
-        avg_hd95_tc = np.mean(results['hd95_tc'])
-        avg_hd95_wt = np.mean(results['hd95_wt'])
+        plt.subplot(1, 3, 2)
+        plt.plot(history['val_dice'], label='Dice')
+        plt.title('Dice Coefficient')
+        plt.xlabel('Epoch')
+        plt.ylabel('Dice')
         
-        # Print overall results
-        print("\nOverall Results:")
-        print(f"Average Dice ET: {avg_dice_et:.4f}")
-        print(f"Average Dice TC: {avg_dice_tc:.4f}")
-        print(f"Average Dice WT: {avg_dice_wt:.4f}")
-        print(f"Average HD95 ET: {avg_hd95_et:.4f}")
-        print(f"Average HD95 TC: {avg_hd95_tc:.4f}")
-        print(f"Average HD95 WT: {avg_hd95_wt:.4f}")
+        plt.subplot(1, 3, 3)
+        plt.plot(history['val_hausdorff'], label='HD95')
+        plt.title('Hausdorff Distance')
+        plt.xlabel('Epoch')
+        plt.ylabel('HD95')
         
-        # Save results to CSV
-        results_df = pd.DataFrame(results)
-        results_df.to_csv(os.path.join(output_dir, 'results.csv'), index=False)
+        plt.tight_layout()
+        plt.savefig('training_history.png')
+        plt.show()
         
-        # Plot overall results
-        plot_overall_results(results, output_dir)
+    elif choice == 'eval':
+        # Load model checkpoint
+        checkpoint_path = os.path.join(checkpoint_dir, 'model_epoch_10.pt')
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded model from {checkpoint_path}")
+            
+            # Evaluate model
+            print("Evaluating model...")
+            metrics = evaluate_model(model, val_loader, device, criterion)
+            
+            print("\nEvaluation Results:")
+            print(f"Dice Score: {metrics['dice']:.4f}")
+            print(f"Hausdorff Distance: {metrics['hausdorff']:.4f}")
+        else:
+            print(f"No checkpoint found at {checkpoint_path}")
     else:
-        print("No results were collected. Training failed for all folds.")
-    
-    print(f"\nTraining and evaluation completed. Results saved to {output_dir}")
+        print("Invalid choice. Please enter 'train' or 'eval'.")
 
-# Function to plot overall results across folds
-def plot_overall_results(results, output_dir):
+def dice_coefficient(pred, target):
     """
-    Plot overall results across folds.
+    Compute the Dice coefficient between two binary tensors.
     
-    Parameters:
-    -----------
-    results : dict
-        Dictionary containing results for each fold
-    output_dir : str
-        Output directory
+    Args:
+        pred (torch.Tensor): Prediction tensor (binary)
+        target (torch.Tensor): Target tensor (binary)
+    
+    Returns:
+        torch.Tensor: Dice coefficient
     """
-    # Extract data for plotting
-    folds = results['fold']
+    smooth = 1e-5
+    intersection = torch.sum(pred * target)
+    union = torch.sum(pred) + torch.sum(target)
     
-    # Plot Dice scores
-    plt.figure(figsize=(10, 6))
-    plt.plot(folds, results['dice_et'], 'o-', label='Enhancing Tumor')
-    plt.plot(folds, results['dice_tc'], 'o-', label='Tumor Core')
-    plt.plot(folds, results['dice_wt'], 'o-', label='Whole Tumor')
-    plt.xlabel('Fold')
-    plt.ylabel('Dice Score')
-    plt.title('Dice Scores Across Folds')
-    plt.legend()
-    plt.grid(True)
-    plt.xticks(folds)
-    plt.savefig(os.path.join(output_dir, 'visualizations', 'dice_scores.png'))
-    plt.close()
+    if union < smooth:
+        return torch.tensor(0.0, device=pred.device)
     
-    # Plot Hausdorff distances
-    plt.figure(figsize=(10, 6))
-    plt.plot(folds, results['hd95_et'], 'o-', label='Enhancing Tumor')
-    plt.plot(folds, results['hd95_tc'], 'o-', label='Tumor Core')
-    plt.plot(folds, results['hd95_wt'], 'o-', label='Whole Tumor')
-    plt.xlabel('Fold')
-    plt.ylabel('Hausdorff Distance (95%)')
-    plt.title('Hausdorff Distances Across Folds')
-    plt.legend()
-    plt.grid(True)
-    plt.xticks(folds)
-    plt.savefig(os.path.join(output_dir, 'visualizations', 'hausdorff_distances.png'))
-    plt.close()
+    return (2.0 * intersection + smooth) / (union + smooth)
 
 if __name__ == "__main__":
     main()
