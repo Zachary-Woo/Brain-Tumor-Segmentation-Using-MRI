@@ -217,10 +217,10 @@ class BrainTumorDataset(Dataset):
                     neg=1,
                     num_samples=4,
                 ),
-                RandRotate90d(keys=["image", "label"], prob=0.5),
-                RandFlipd(keys=["image", "label"], prob=0.5),
-                RandZoomd(keys=["image", "label"], prob=0.5, min_zoom=0.9, max_zoom=1.1),
+                RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(0, 1)),  # Specify 2D rotation axes
+                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),  # Only flip along one axis
             ]
+            # Removed RandZoomd which was causing issues
             self.transform = Compose(base_transforms + train_transforms)
         else:
             self.transform = Compose(base_transforms)
@@ -239,11 +239,25 @@ class BrainTumorDataset(Dataset):
     
     def __getitem__(self, idx):
         data = self.dataset[idx]
-        image = data["image"]
-        label = data["label"]
+        
+        # Check if data is a list or a dictionary
+        if isinstance(data, list):
+            # If it's a list, assume first item is image, second is label
+            image = data[0]
+            label = data[1]
+        else:
+            # If it's a dictionary (as expected), extract image and label
+            image = data["image"]
+            label = data["label"]
         
         # Process the label to create one-hot encoding
         label_tensor = label.squeeze(0)  # Remove channel dimension
+        
+        # Handle the case where the label has a third dimension of size 1
+        if label_tensor.dim() == 3 and label_tensor.shape[2] == 1:
+            label_tensor = label_tensor.squeeze(2)  # Remove the third dimension
+            
+        # Create one-hot encoding
         one_hot = torch.zeros((4, *label_tensor.shape), dtype=torch.float32)
         
         # Background (class 0)
@@ -255,6 +269,10 @@ class BrainTumorDataset(Dataset):
         # GD-enhancing tumor (class 4, mapped to index 3)
         one_hot[3] = (label_tensor == 4).float()
         
+        # Handle the case where the image has a third dimension of size 1
+        if image.dim() == 4 and image.shape[3] == 1:
+            image = image.squeeze(3)  # Remove the third dimension
+            
         return image, one_hot, idx
 
 # Function to calculate Dice score
@@ -339,7 +357,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     patience_counter = 0
     
     # Initialize gradient scaler for mixed precision training
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
     
     # Set gradient clipping threshold
     max_grad_norm = 1.0
@@ -349,7 +367,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         model.train()
         epoch_train_loss = 0
         
-        for images, labels, _ in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Training'):
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Training'):
+            # Unpack the batch - handle different formats
+            if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+                images, labels, _ = batch  # Ignoring the index
+            elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                images, labels = batch[:2]  # Take first two elements
+            else:
+                print(f"Warning: Unexpected batch format: {type(batch)}")
+                continue
+                
             images = images.to(device)
             labels = labels.to(device)
             
@@ -358,7 +385,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             
             # Mixed precision training
             if scaler is not None:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type='cuda'):
                     outputs = model(images)
                     loss = criterion(outputs, labels)
                 
@@ -400,13 +427,22 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         epoch_val_loss = 0
         
         with torch.no_grad():
-            for images, labels, _ in tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Validation'):
+            for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Validation'):
+                # Unpack the batch - handle different formats
+                if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+                    images, labels, _ = batch  # Ignoring the index
+                elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    images, labels = batch[:2]  # Take first two elements
+                else:
+                    print(f"Warning: Unexpected batch format: {type(batch)}")
+                    continue
+                
                 images = images.to(device)
                 labels = labels.to(device)
                 
                 # Forward pass
                 if scaler is not None:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type='cuda'):
                         outputs = model(images)
                         loss = criterion(outputs, labels)
                 else:
@@ -493,7 +529,17 @@ def evaluate_model(model, test_loader):
     }
     
     with torch.no_grad():
-        for images, labels, slice_idx in tqdm(test_loader, desc='Evaluating'):
+        for batch in tqdm(test_loader, desc='Evaluating'):
+            # Unpack the batch - handle different formats
+            if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+                images, labels, slice_idx = batch
+            elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                images, labels = batch[:2]
+                slice_idx = torch.zeros(images.size(0))  # Dummy indices
+            else:
+                print(f"Warning: Unexpected batch format: {type(batch)}")
+                continue
+                
             images = images.to(device)
             labels = labels.to(device)
             
@@ -586,83 +632,112 @@ def visualize_results(examples, fold, output_dir):
     output_dir : str
         Output directory
     """
-    plt.figure(figsize=(15, 10))
-    
-    for i, (images, labels, preds, slice_idx) in enumerate(examples[:5]):  # Show up to 5 examples
-        if i >= 5:  # Limit to 5 examples
-            break
+    if not examples:
+        print("No examples to visualize")
+        return
+        
+    try:
+        plt.figure(figsize=(15, 10))
+        
+        for i, example_data in enumerate(examples[:5]):  # Show up to 5 examples
+            if i >= 5:  # Limit to 5 examples
+                break
+                
+            if len(example_data) < 3:
+                print(f"Warning: Example {i} does not contain enough data elements")
+                continue
+                
+            # Unpack the example data
+            images, labels, preds = example_data[:3]
+            slice_idx = example_data[3] if len(example_data) > 3 else torch.zeros(1)
             
-        # Get the first image in the batch
-        image = images[0]  # Get first image from batch
-        label = labels[0]  # Get first label from batch
-        pred = preds[0]    # Get first prediction from batch
+            # Make sure we have data in the batch
+            if images.size(0) == 0 or labels.size(0) == 0 or preds.size(0) == 0:
+                print(f"Warning: Example {i} contains empty tensors")
+                continue
+                
+            # Get the first image in the batch
+            image = images[0]  # Get first image from batch
+            label = labels[0]  # Get first label from batch
+            pred = preds[0]    # Get first prediction from batch
+            
+            # Check dimensions and channels
+            if image.dim() < 3 or label.dim() < 3:
+                print(f"Warning: Example {i} has incorrect dimensions - image: {image.shape}, label: {label.shape}")
+                continue
+                
+            # Extract T1ce modality for visualization (or use first channel if not clear)
+            t1ce = image[0].numpy() if image.size(0) > 0 else np.zeros((128, 128))
+            
+            try:
+                # Convert to binary masks
+                # Labels are already one-hot encoded
+                # Channel 0: background (label 0)
+                # Channel 1: necrotic and non-enhancing tumor (label 1)
+                # Channel 2: peritumoral edema (label 2)
+                # Channel 3: enhancing tumor (label 4)
+                gt_et = label[3].float().numpy() if label.size(0) > 3 else np.zeros_like(t1ce)  # Enhancing tumor (label 4)
+                
+                # Use logical operations for combining masks
+                gt_tc = ((label[1] > 0.5) | (label[3] > 0.5)).float().numpy() if label.size(0) > 3 else np.zeros_like(t1ce)
+                gt_wt = ((label[1] > 0.5) | (label[2] > 0.5) | (label[3] > 0.5)).float().numpy() if label.size(0) > 3 else np.zeros_like(t1ce)
+                
+                # Predictions - convert from class indices to binary masks
+                # preds has values 0-3 (0: background, 1: necrotic, 2: edema, 3: enhancing)
+                pred_et = (pred == 3).float().numpy()  # Enhancing tumor (index 3 for class 4)
+                pred_tc = ((pred == 1) | (pred == 3)).float().numpy()  # Tumor core (indices 1 and 3)
+                pred_wt = ((pred == 1) | (pred == 2) | (pred == 3)).float().numpy()  # Whole tumor (indices 1, 2, and 3)
+                
+                # Create a 3x3 grid for each example
+                plt.subplot(5, 3, i*3 + 1)
+                plt.imshow(t1ce, cmap='gray')
+                plt.contour(gt_wt, colors='g', linewidths=0.5)
+                plt.contour(gt_tc, colors='b', linewidths=0.5)
+                plt.contour(gt_et, colors='r', linewidths=0.5)
+                plt.title(f'Ground Truth (Slice {slice_idx[0].item() if isinstance(slice_idx, torch.Tensor) else 0})')
+                plt.axis('off')
+                
+                plt.subplot(5, 3, i*3 + 2)
+                plt.imshow(t1ce, cmap='gray')
+                plt.contour(pred_wt, colors='g', linewidths=0.5)
+                plt.contour(pred_tc, colors='b', linewidths=0.5)
+                plt.contour(pred_et, colors='r', linewidths=0.5)
+                plt.title('Prediction')
+                plt.axis('off')
+                
+                plt.subplot(5, 3, i*3 + 3)
+                # Create a color-coded segmentation mask
+                gt_mask = np.zeros((t1ce.shape[0], t1ce.shape[1], 3))
+                pred_mask = np.zeros((t1ce.shape[0], t1ce.shape[1], 3))
+                
+                # Ground truth: Red = ET, Blue = TC, Green = WT
+                gt_mask[gt_wt > 0.5, 1] = 1  # Green for WT
+                gt_mask[gt_tc > 0.5, 2] = 1  # Blue for TC
+                gt_mask[gt_et > 0.5, 0] = 1  # Red for ET
+                
+                # Prediction: Red = ET, Blue = TC, Green = WT
+                pred_mask[pred_wt > 0.5, 1] = 1  # Green for WT
+                pred_mask[pred_tc > 0.5, 2] = 1  # Blue for TC
+                pred_mask[pred_et > 0.5, 0] = 1  # Red for ET
+                
+                # Overlay ground truth and prediction
+                overlay = np.zeros((t1ce.shape[0], t1ce.shape[1], 3))
+                overlay[..., 0] = np.maximum(gt_mask[..., 0] * 0.5, pred_mask[..., 0])  # Red channel
+                overlay[..., 1] = np.maximum(gt_mask[..., 1] * 0.5, pred_mask[..., 1])  # Green channel
+                overlay[..., 2] = np.maximum(gt_mask[..., 2] * 0.5, pred_mask[..., 2])  # Blue channel
+                
+                plt.imshow(overlay)
+                plt.title('Overlay (GT + Pred)')
+                plt.axis('off')
+            except Exception as e:
+                print(f"Error visualizing example {i}: {e}")
+                continue
         
-        # Extract T1ce modality for visualization
-        t1ce = image[0].numpy()
-        
-        # Convert to binary masks
-        # Labels are already one-hot encoded
-        # Channel 0: background (label 0)
-        # Channel 1: necrotic and non-enhancing tumor (label 1)
-        # Channel 2: peritumoral edema (label 2)
-        # Channel 3: enhancing tumor (label 4)
-        gt_et = label[3].float().numpy()  # Enhancing tumor (label 4)
-        
-        # Use logical operations for combining masks
-        gt_tc = ((label[1] > 0.5) | (label[3] > 0.5)).float().numpy()  # Tumor core (labels 1 and 4)
-        gt_wt = ((label[1] > 0.5) | (label[2] > 0.5) | (label[3] > 0.5)).float().numpy()  # Whole tumor (labels 1, 2, and 4)
-        
-        # Predictions - convert from class indices to binary masks
-        # preds has values 0-3 (0: background, 1: necrotic, 2: edema, 3: enhancing)
-        pred_et = (pred == 3).float().numpy()  # Enhancing tumor (index 3 for class 4)
-        pred_tc = ((pred == 1) | (pred == 3)).float().numpy()  # Tumor core (indices 1 and 3)
-        pred_wt = ((pred == 1) | (pred == 2) | (pred == 3)).float().numpy()  # Whole tumor (indices 1, 2, and 3)
-        
-        # Create a 3x3 grid for each example
-        plt.subplot(5, 3, i*3 + 1)
-        plt.imshow(t1ce, cmap='gray')
-        plt.contour(gt_wt, colors='g', linewidths=0.5)
-        plt.contour(gt_tc, colors='b', linewidths=0.5)
-        plt.contour(gt_et, colors='r', linewidths=0.5)
-        plt.title(f'Ground Truth (Slice {slice_idx})')
-        plt.axis('off')
-        
-        plt.subplot(5, 3, i*3 + 2)
-        plt.imshow(t1ce, cmap='gray')
-        plt.contour(pred_wt, colors='g', linewidths=0.5)
-        plt.contour(pred_tc, colors='b', linewidths=0.5)
-        plt.contour(pred_et, colors='r', linewidths=0.5)
-        plt.title('Prediction')
-        plt.axis('off')
-        
-        plt.subplot(5, 3, i*3 + 3)
-        # Create a color-coded segmentation mask
-        gt_mask = np.zeros((t1ce.shape[0], t1ce.shape[1], 3))
-        pred_mask = np.zeros((t1ce.shape[0], t1ce.shape[1], 3))
-        
-        # Ground truth: Red = ET, Blue = TC, Green = WT
-        gt_mask[gt_wt > 0.5, 1] = 1  # Green for WT
-        gt_mask[gt_tc > 0.5, 2] = 1  # Blue for TC
-        gt_mask[gt_et > 0.5, 0] = 1  # Red for ET
-        
-        # Prediction: Red = ET, Blue = TC, Green = WT
-        pred_mask[pred_wt > 0.5, 1] = 1  # Green for WT
-        pred_mask[pred_tc > 0.5, 2] = 1  # Blue for TC
-        pred_mask[pred_et > 0.5, 0] = 1  # Red for ET
-        
-        # Overlay ground truth and prediction
-        overlay = np.zeros((t1ce.shape[0], t1ce.shape[1], 3))
-        overlay[..., 0] = np.maximum(gt_mask[..., 0] * 0.5, pred_mask[..., 0])  # Red channel
-        overlay[..., 1] = np.maximum(gt_mask[..., 1] * 0.5, pred_mask[..., 1])  # Green channel
-        overlay[..., 2] = np.maximum(gt_mask[..., 2] * 0.5, pred_mask[..., 2])  # Blue channel
-        
-        plt.imshow(overlay)
-        plt.title('Overlay (GT + Pred)')
-        plt.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'visualizations', f'segmentation_results_fold{fold+1}.png'))
-    plt.close()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'visualizations', f'segmentation_results_fold{fold+1}.png'))
+        plt.close()
+    except Exception as e:
+        print(f"Error in visualization: {e}")
 
 # Function to analyze dataset for enhancing tumor regions
 def analyze_dataset_et(data_loader):
@@ -681,25 +756,37 @@ def analyze_dataset_et(data_loader):
     et_pixel_counts = []
     et_pixel_percentages = []
     
-    for images, labels in tqdm(data_loader, desc='Analyzing dataset'):
-        total_slices += images.size(0)
-        
-        for i in range(images.size(0)):
-            # Extract enhancing tumor mask (channel 3 for class 4)
-            et_mask = labels[i, 3]  # Already a float tensor
+    try:
+        for batch in tqdm(data_loader, desc='Analyzing dataset'):
+            # Unpack batch - handle both list and tuple formats
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                images, labels = batch[0], batch[1]
+            else:
+                # Skip this batch if format is unexpected
+                continue
+                
+            total_slices += images.size(0)
             
-            # Count pixels
-            et_pixels = torch.sum(et_mask).item()
-            total_pixels = et_mask.numel()
-            
-            if et_pixels > 0:
-                slices_with_et += 1
-                et_pixel_counts.append(et_pixels)
-                et_pixel_percentages.append(100 * et_pixels / total_pixels)
+            for i in range(images.size(0)):
+                # Extract enhancing tumor mask (channel 3 for class 4)
+                if labels.size(1) > 3:  # Make sure we have enough channels
+                    et_mask = labels[i, 3]  # Already a float tensor
+                    
+                    # Count pixels
+                    et_pixels = torch.sum(et_mask).item()
+                    total_pixels = et_mask.numel()
+                    
+                    if et_pixels > 0:
+                        slices_with_et += 1
+                        et_pixel_counts.append(et_pixels)
+                        et_pixel_percentages.append(100 * et_pixels / total_pixels)
+    except Exception as e:
+        print(f"Warning during dataset analysis: {e}")
+        # Continue with partial results if any
     
     # Print statistics
     print(f"Total slices analyzed: {total_slices}")
-    print(f"Slices containing enhancing tumor: {slices_with_et} ({100 * slices_with_et / total_slices:.2f}%)")
+    print(f"Slices containing enhancing tumor: {slices_with_et} ({100 * slices_with_et / max(total_slices, 1):.2f}%)")
     
     if slices_with_et > 0:
         print(f"Average ET pixels per slice (when present): {np.mean(et_pixel_counts):.2f}")
@@ -710,7 +797,7 @@ def analyze_dataset_et(data_loader):
     
     print("==========================================================")
     
-    return slices_with_et / total_slices
+    return slices_with_et / max(total_slices, 1)  # Avoid division by zero
 
 # Main function
 def main():
