@@ -5,6 +5,8 @@
 
 Note: Due to Canvas submission limitations allowing only one submission, the complete project report (Programming Assignment #2 Report.pdf) has been included in this GitHub repository alongside the code.
 
+Disclaimer: The results in the report and shown below are from version 2. Version 3 is still running at time of the initial upload so the results are unclear in comparison.
+
 ## Implementation Details
 
 ### System Specifications
