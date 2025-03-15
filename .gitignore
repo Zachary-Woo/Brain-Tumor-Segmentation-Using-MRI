@@ -1,2 +1,5 @@
 Task01_BrainTumour
 results_v3/checkpoints
+checkpoints/
+__pycache__/
+
