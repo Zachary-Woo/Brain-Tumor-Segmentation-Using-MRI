@@ -524,6 +524,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     if len(val_loader) == 0:
         raise ValueError("Validation data loader is empty. Cannot validate the model.")
     
+    # Ensure checkpoint directory exists
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -532,15 +535,31 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     patience_counter = 0
     
     # Initialize gradient scaler for mixed precision training
-    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    scaler = torch.amp.GradScaler() if torch.cuda.is_available() else None
     
     # Set gradient clipping threshold
     max_grad_norm = 1.0
+    
+    # Track NaN occurrences
+    nan_count = 0
+    max_nan_tolerance = 5
+    
+    # Save initial model as a fallback
+    initial_checkpoint = {
+        'epoch': -1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'best_val_loss': float('inf')
+    }
+    torch.save(initial_checkpoint, checkpoint_path.replace('.pth', '_initial.pth'))
     
     for epoch in range(num_epochs):
         # Training phase
         model.train()
         epoch_train_loss = 0
+        batch_count = 0
         
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Training'):
             # Unpack the batch - handle different formats
@@ -558,34 +577,68 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             # Zero the gradients
             optimizer.zero_grad()
             
-            # Mixed precision training
-            if scaler is not None:
-                with torch.amp.autocast(device_type='cuda'):
+            try:
+                # Mixed precision training
+                if scaler is not None:
+                    with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                        outputs = model(images)
+                        loss = criterion(outputs, labels)
+                        
+                        # Check for NaN loss
+                        if torch.isnan(loss).item() or torch.isinf(loss).item():
+                            print(f"\nWARNING: NaN or Inf loss detected in batch. Skipping batch.")
+                            nan_count += 1
+                            if nan_count > max_nan_tolerance:
+                                print(f"Too many NaN losses ({nan_count}). Stopping training.")
+                                # Load the initial model as fallback
+                                checkpoint = torch.load(checkpoint_path.replace('.pth', '_initial.pth'))
+                                model.load_state_dict(checkpoint['model_state_dict'])
+                                return train_losses, val_losses
+                            continue
+                    
+                    # Backward pass with gradient scaling
+                    scaler.scale(loss).backward()
+                    
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
+                    # Optimizer step with gradient scaling
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Regular training
                     outputs = model(images)
                     loss = criterion(outputs, labels)
+                    
+                    # Check for NaN loss
+                    if torch.isnan(loss).item() or torch.isinf(loss).item():
+                        print(f"\nWARNING: NaN or Inf loss detected in batch. Skipping batch.")
+                        nan_count += 1
+                        if nan_count > max_nan_tolerance:
+                            print(f"Too many NaN losses ({nan_count}). Stopping training.")
+                            # Load the initial model as fallback
+                            checkpoint = torch.load(checkpoint_path.replace('.pth', '_initial.pth'))
+                            model.load_state_dict(checkpoint['model_state_dict'])
+                            return train_losses, val_losses
+                        continue
+                    
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
+                    optimizer.step()
                 
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
-                
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                
-                # Optimizer step with gradient scaling
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # Regular training
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                
-                optimizer.step()
+                # Update counters
+                batch_loss = loss.item()
+                if not np.isnan(batch_loss) and not np.isinf(batch_loss):
+                    epoch_train_loss += batch_loss
+                    batch_count += 1
             
-            epoch_train_loss += loss.item()
+            except Exception as e:
+                print(f"Error during training batch: {e}")
+                continue
             
             # Monitor memory usage and adjust batch size if needed
             if torch.cuda.is_available():
@@ -594,12 +647,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     print("\nWARNING: High memory usage detected. Consider reducing batch size.")
         
         # Calculate average training loss for this epoch
-        epoch_train_loss /= len(train_loader)
+        epoch_train_loss = epoch_train_loss / max(1, batch_count)  # Avoid division by zero
         train_losses.append(epoch_train_loss)
         
         # Validation phase
         model.eval()
         epoch_val_loss = 0
+        val_batch_count = 0
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} - Validation'):
@@ -615,19 +669,27 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 images = images.to(device)
                 labels = labels.to(device)
                 
-                # Forward pass
-                if scaler is not None:
-                    with torch.amp.autocast(device_type='cuda'):
+                try:
+                    # Forward pass
+                    if scaler is not None:
+                        with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                            outputs = model(images)
+                            loss = criterion(outputs, labels)
+                    else:
                         outputs = model(images)
                         loss = criterion(outputs, labels)
-                else:
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                
-                epoch_val_loss += loss.item()
+                    
+                    # Update counters
+                    batch_loss = loss.item()
+                    if not np.isnan(batch_loss) and not np.isinf(batch_loss):
+                        epoch_val_loss += batch_loss
+                        val_batch_count += 1
+                except Exception as e:
+                    print(f"Error during validation batch: {e}")
+                    continue
         
         # Calculate average validation loss for this epoch
-        epoch_val_loss /= len(val_loader)
+        epoch_val_loss = epoch_val_loss / max(1, val_batch_count)  # Avoid division by zero
         val_losses.append(epoch_val_loss)
         
         # Update learning rate based on validation loss
@@ -663,9 +725,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 break
     
     # Load the best model
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"Loaded best model from epoch {checkpoint['epoch']+1} with validation loss {checkpoint['best_val_loss']:.4f}")
+    try:
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded best model from epoch {checkpoint['epoch']+1} with validation loss {checkpoint['best_val_loss']:.4f}")
+    except Exception as e:
+        print(f"Error loading best model: {e}. Using current model state.")
     
     return train_losses, val_losses
 
@@ -703,6 +768,17 @@ def evaluate_model(model, test_loader):
         'hd95_wt': []
     }
     
+    # Add debugging counters
+    debug_stats = {
+        'total_slices': 0,
+        'slices_with_et_gt': 0,
+        'slices_with_tc_gt': 0,
+        'slices_with_wt_gt': 0,
+        'slices_with_et_pred': 0,
+        'slices_with_tc_pred': 0,
+        'slices_with_wt_pred': 0,
+    }
+    
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
             # Unpack the batch - handle different formats
@@ -722,12 +798,33 @@ def evaluate_model(model, test_loader):
             outputs = model(images)
             outputs = torch.softmax(outputs, dim=1)
             
+            # Debug: Print output statistics for first batch
+            if debug_stats['total_slices'] == 0:
+                print("\n===== MODEL OUTPUT DEBUG =====")
+                print(f"Output shape: {outputs.shape}")
+                print(f"Output min: {outputs.min().item()}, max: {outputs.max().item()}")
+                print(f"Output class distribution:")
+                for c in range(outputs.shape[1]):
+                    print(f"  Class {c}: {torch.argmax(outputs, dim=1).eq(c).float().mean().item()*100:.2f}%")
+                print("=============================\n")
+                
+                # Debug: Print label statistics for first batch
+                print("\n===== LABEL DEBUG =====")
+                print(f"Label shape: {labels.shape}")
+                print(f"Label min: {labels.min().item()}, max: {labels.max().item()}")
+                print(f"Label class distribution:")
+                for c in range(labels.shape[1]):
+                    print(f"  Class {c}: {(labels[:, c] > 0.5).float().mean().item()*100:.2f}%")
+                print("=======================\n")
+            
             # Store a few examples for visualization
             if len(examples) < 5:
                 examples.append((images.cpu(), labels.cpu(), torch.argmax(outputs, dim=1).cpu(), slice_idx))
             
             # Process each sample in the batch
             for i in range(images.size(0)):
+                debug_stats['total_slices'] += 1
+                
                 # Extract individual predictions and labels
                 pred = outputs[i:i+1]  # Keep batch dimension
                 label = labels[i:i+1]  # Keep batch dimension
@@ -742,8 +839,22 @@ def evaluate_model(model, test_loader):
                 gt_tc = ((label[:, 1] > 0.5) | (label[:, 3] > 0.5)).float()
                 
                 # Whole tumor (WT) - labels 1, 2, and 4
-                pred_wt = ((torch.argmax(pred, dim=1) > 0)).float()  # Any non-background
+                pred_wt = ((torch.argmax(pred, dim=1) > 0)).float()
                 gt_wt = ((label[:, 1:] > 0.5).sum(dim=1) > 0).float()
+                
+                # Update debug counters
+                if torch.any(gt_et):
+                    debug_stats['slices_with_et_gt'] += 1
+                if torch.any(gt_tc):
+                    debug_stats['slices_with_tc_gt'] += 1
+                if torch.any(gt_wt):
+                    debug_stats['slices_with_wt_gt'] += 1
+                if torch.any(pred_et):
+                    debug_stats['slices_with_et_pred'] += 1
+                if torch.any(pred_tc):
+                    debug_stats['slices_with_tc_pred'] += 1
+                if torch.any(pred_wt):
+                    debug_stats['slices_with_wt_pred'] += 1
                 
                 # Calculate metrics for each region
                 if torch.any(gt_et):
@@ -784,6 +895,19 @@ def evaluate_model(model, test_loader):
                     hd_result = hausdorff_metric.aggregate()
                     if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
                         all_metrics['hd95_wt'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
+    
+    # Print debug statistics
+    print("\n===== EVALUATION DEBUG STATISTICS =====")
+    print(f"Total slices evaluated: {debug_stats['total_slices']}")
+    print(f"Ground truth statistics:")
+    print(f"  - Slices with ET: {debug_stats['slices_with_et_gt']} ({100*debug_stats['slices_with_et_gt']/max(1, debug_stats['total_slices']):.2f}%)")
+    print(f"  - Slices with TC: {debug_stats['slices_with_tc_gt']} ({100*debug_stats['slices_with_tc_gt']/max(1, debug_stats['total_slices']):.2f}%)")
+    print(f"  - Slices with WT: {debug_stats['slices_with_wt_gt']} ({100*debug_stats['slices_with_wt_gt']/max(1, debug_stats['total_slices']):.2f}%)")
+    print(f"Prediction statistics:")
+    print(f"  - Slices with ET predicted: {debug_stats['slices_with_et_pred']} ({100*debug_stats['slices_with_et_pred']/max(1, debug_stats['total_slices']):.2f}%)")
+    print(f"  - Slices with TC predicted: {debug_stats['slices_with_tc_pred']} ({100*debug_stats['slices_with_tc_pred']/max(1, debug_stats['total_slices']):.2f}%)")
+    print(f"  - Slices with WT predicted: {debug_stats['slices_with_wt_pred']} ({100*debug_stats['slices_with_wt_pred']/max(1, debug_stats['total_slices']):.2f}%)")
+    print("=====================================\n")
     
     # Calculate mean metrics
     results = {
@@ -1007,7 +1131,7 @@ def main():
     # Set hyperparameters
     batch_size = 4  # Reduced batch size to save memory
     num_epochs = 10
-    learning_rate = 0.001
+    learning_rate = 0.0005  # Reduced learning rate for stability
     
     # Define paths
     data_dir = 'Task01_BrainTumour'
@@ -1153,17 +1277,43 @@ def main():
             spatial_dims=2,
             in_channels=4,
             out_channels=4,
-            channels=(64, 128, 256, 512, 1024),
-            strides=(2, 2, 2, 2),
+            channels=(16, 32, 64, 128),  # Smaller architecture to prevent overfitting
+            strides=(2, 2, 2),
             num_res_units=2,
+            norm='BATCH',  # Add batch normalization
+            dropout=0.2,   # Add dropout for regularization
         ).to(device)
         
-        # Use MONAI's DiceCELoss with to_onehot_y=False since our labels are already one-hot encoded
-        criterion = DiceCELoss(to_onehot_y=False, softmax=True)
+        # Initialize weights properly to prevent NaN issues
+        for m in model.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
         
-        # Define optimizer and scheduler
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+        # Use MONAI's DiceCELoss with to_onehot_y=False since our labels are already one-hot encoded
+        # Use a higher weight for CE loss to stabilize training
+        criterion = DiceCELoss(
+            to_onehot_y=False, 
+            softmax=True, 
+            lambda_ce=0.8,  # Higher weight for CE loss
+            lambda_dice=0.2,  # Lower weight for Dice loss
+            smooth_nr=1e-5,  # Increase smoothing factor
+            smooth_dr=1e-5
+        )
+        
+        # Define optimizer and scheduler with lower learning rate
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)  # Add weight decay
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min', 
+            factor=0.2,  # Larger reduction factor
+            patience=5,   # More patience
+            min_lr=1e-6   # Set minimum learning rate
+        )
         
         # Define checkpoint path
         checkpoint_path = os.path.join(output_dir, 'checkpoints', f'model_fold{fold+1}.pth')
