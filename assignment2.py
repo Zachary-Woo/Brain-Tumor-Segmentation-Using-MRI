@@ -43,7 +43,6 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import nibabel as nib
 from sklearn.model_selection import KFold
 import torch
 import torch.nn as nn
@@ -51,8 +50,25 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import pandas as pd
-from scipy.ndimage import generate_binary_structure, binary_erosion, distance_transform_edt
-import random
+from monai.metrics import compute_hausdorff_distance
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    RandRotate90d,
+    RandFlipd,
+    RandZoomd,
+    EnsureTyped,
+    NormalizeIntensityd,
+    CropForegroundd,
+    Orientationd,
+    Spacingd,
+    RandCropByPosNegLabeld
+)
+from monai.losses import DiceLoss as DiceCELoss
+from monai.data import Dataset as MonaiDataset
+from monai.networks.nets import UNet as MonaiUNet
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
 
 # Set random seed for reproducibility
 np.random.seed(42)
@@ -177,148 +193,69 @@ class UNet(nn.Module):
 # Define the dataset class
 class BrainTumorDataset(Dataset):
     def __init__(self, image_files, label_files, transform=None):
-        self.image_files = image_files
-        self.label_files = label_files
-        self.transform = transform
+        self.image_files = [os.path.join(images_dir, f) for f in image_files]
+        self.label_files = [os.path.join(labels_dir, f) for f in label_files]
         
-        # Store slice information without loading data
-        self.slices_info = []
-        self._scan_data()
+        # Define base MONAI transforms for both training and validation
+        base_transforms = [
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(keys=["image", "label"], axcodes="RAS"),
+            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
+            NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
+            CropForegroundd(keys=["image", "label"], source_key="image"),
+            EnsureTyped(keys=["image", "label"]),
+        ]
         
-    def _scan_data(self):
-        """Scan data to identify slices with tumors without loading entire volumes"""
-        print("Scanning data to identify slices with tumors...")
-        for img_path, label_path in tqdm(zip(self.image_files, self.label_files), total=len(self.image_files)):
-            try:
-                # Load label file to identify slices with tumors
-                label_nib = nib.load(os.path.join(labels_dir, label_path))
-                label_data = label_nib.get_fdata()
-                
-                # Get shape information
-                img_nib = nib.load(os.path.join(images_dir, img_path))
-                img_shape = img_nib.shape
-                
-                print(f"Scanning {img_path}: image shape {img_shape}, label shape {label_data.shape}")
-                
-                # Find slices with tumors
-                for z in range(label_data.shape[2]):
-                    # Check if this slice has tumor
-                    if np.sum(label_data[:, :, z]) > 0:
-                        # Store slice information without loading the actual data
-                        self.slices_info.append({
-                            'img_path': img_path,
-                            'label_path': label_path,
-                            'slice_idx': z,
-                        })
-            except Exception as e:
-                print(f"Error scanning {img_path}: {e}")
+        if transform:  # Add data augmentation transforms during training
+            train_transforms = [
+                RandCropByPosNegLabeld(
+                    keys=["image", "label"],
+                    label_key="label",
+                    spatial_size=(240, 240),
+                    pos=1,
+                    neg=1,
+                    num_samples=4,
+                ),
+                RandRotate90d(keys=["image", "label"], prob=0.5),
+                RandFlipd(keys=["image", "label"], prob=0.5),
+                RandZoomd(keys=["image", "label"], prob=0.5, min_zoom=0.9, max_zoom=1.1),
+            ]
+            self.transform = Compose(base_transforms + train_transforms)
+        else:
+            self.transform = Compose(base_transforms)
         
-        print(f"Found {len(self.slices_info)} slices with tumor regions")
-    
-    def _normalize(self, data):
-        """Normalize data to [0, 1] range"""
-        data_min = np.min(data)
-        data_max = np.max(data)
-        if data_max > data_min:
-            return (data - data_min) / (data_max - data_min)
-        return data
-    
+        # Create data list for MONAI dataset
+        self.data_dicts = [
+            {"image": image_file, "label": label_file}
+            for image_file, label_file in zip(self.image_files, self.label_files)
+        ]
+        
+        # Initialize MONAI dataset
+        self.dataset = MonaiDataset(self.data_dicts, transform=self.transform)
+        
     def __len__(self):
-        return len(self.slices_info)
+        return len(self.dataset)
     
     def __getitem__(self, idx):
-        # Get slice information
-        slice_info = self.slices_info[idx]
-        img_path = slice_info['img_path']
-        label_path = slice_info['label_path']
-        slice_idx = slice_info['slice_idx']
+        data = self.dataset[idx]
+        image = data["image"]
+        label = data["label"]
         
-        try:
-            # Load image and extract only the needed slice
-            img_nib = nib.load(os.path.join(images_dir, img_path))
-            img_data = img_nib.dataobj  # Using dataobj instead of get_fdata() to avoid loading entire volume
-            
-            # Extract the specific slice
-            img_slice = np.array(img_data[:, :, slice_idx, :])  # Shape: [H, W, 4]
-            
-            # Normalize each modality
-            for c in range(img_slice.shape[2]):
-                img_slice[:, :, c] = self._normalize(img_slice[:, :, c])
-            
-            # Load label and extract only the needed slice
-            label_nib = nib.load(os.path.join(labels_dir, label_path))
-            label_data = label_nib.dataobj
-            label_slice = np.array(label_data[:, :, slice_idx])  # Shape: [H, W]
-            
-            # Convert to tensors
-            img = torch.tensor(img_slice, dtype=torch.float32).permute(2, 0, 1)  # [4, H, W]
-            
-            # Convert label to one-hot encoding
-            label_tensor = torch.tensor(label_slice, dtype=torch.long)
-            
-            # Create one-hot encoding
-            one_hot = torch.zeros((4, *label_tensor.shape), dtype=torch.float32)
-            
-            # Background (class 0)
-            one_hot[0] = (label_tensor == 0).float()
-            
-            # Necrotic and non-enhancing tumor (class 1)
-            one_hot[1] = (label_tensor == 1).float()
-            
-            # Peritumoral edema (class 2)
-            one_hot[2] = (label_tensor == 2).float()
-            
-            # GD-enhancing tumor (class 4, mapped to index 3)
-            one_hot[3] = (label_tensor == 4).float()
-            
-            # Apply transformations if specified
-            if self.transform:
-                img, one_hot = self.transform(img, one_hot)
-            
-            return img, one_hot, slice_idx
-            
-        except Exception as e:
-            print(f"Error loading slice {slice_idx} from {img_path}: {e}")
-            # Return a dummy sample in case of error
-            # This prevents the dataloader from crashing
-            dummy_img = torch.zeros((4, 240, 240), dtype=torch.float32)
-            dummy_label = torch.zeros((4, 240, 240), dtype=torch.float32)
-            dummy_label[0] = 1.0  # All background
-            return dummy_img, dummy_label, slice_idx
-
-# Define the Dice loss
-class DiceLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(DiceLoss, self).__init__()
-        # Default class weights if none provided (giving higher weight to tumor classes)
-        self.weight = weight if weight is not None else torch.tensor([0.1, 0.3, 0.3, 0.3])
-
-    def forward(self, inputs, targets, smooth=1):
-        # Apply softmax to get probabilities
-        inputs = torch.softmax(inputs, dim=1)
+        # Process the label to create one-hot encoding
+        label_tensor = label.squeeze(0)  # Remove channel dimension
+        one_hot = torch.zeros((4, *label_tensor.shape), dtype=torch.float32)
         
-        # Initialize total loss
-        total_loss = 0
+        # Background (class 0)
+        one_hot[0] = (label_tensor == 0).float()
+        # Necrotic and non-enhancing tumor (class 1)
+        one_hot[1] = (label_tensor == 1).float()
+        # Peritumoral edema (class 2)
+        one_hot[2] = (label_tensor == 2).float()
+        # GD-enhancing tumor (class 4, mapped to index 3)
+        one_hot[3] = (label_tensor == 4).float()
         
-        # Calculate Dice loss for each class separately
-        for i in range(inputs.size(1)):
-            # Get current class
-            input_class = inputs[:, i, :, :]
-            target_class = targets[:, i, :, :]
-            
-            # Flatten inputs and targets, ensuring they are contiguous
-            input_flat = input_class.contiguous().reshape(-1)
-            target_flat = target_class.contiguous().reshape(-1)
-            
-            # Calculate intersection and dice score
-            intersection = (input_flat * target_flat).sum()
-            dice = (2. * intersection + smooth) / (input_flat.sum() + target_flat.sum() + smooth)
-            
-            # Apply class weight and add to total loss
-            total_loss += self.weight[i] * (1 - dice)
-        
-        # Return average loss
-        return total_loss / inputs.size(1)
+        return image, one_hot, idx
 
 # Function to calculate Dice score
 def dice_score(pred, target, smooth=1e-6):
@@ -330,10 +267,10 @@ def dice_score(pred, target, smooth=1e-6):
     
     return dice.item()
 
-# Function to calculate Hausdorff distance
+# Function to calculate Hausdorff distance using MONAI's implementation
 def hausdorff_distance(pred, target):
     """
-    Calculate the 95% Hausdorff Distance between binary objects.
+    Calculate the 95% Hausdorff Distance using MONAI's implementation.
     
     Parameters:
     -----------
@@ -347,65 +284,16 @@ def hausdorff_distance(pred, target):
     float
         The 95% Hausdorff distance
     """
-    pred = pred.cpu().numpy().astype(bool)
-    target = target.cpu().numpy().astype(bool)
+    # Ensure inputs are on CPU and in correct format
+    pred = pred.unsqueeze(0).unsqueeze(0).cpu()  # Add batch and channel dimensions
+    target = target.unsqueeze(0).unsqueeze(0).cpu()
     
-    # Quick check for identical masks
-    if np.array_equal(pred, target):
-        # If masks are identical and contain positive values, return 0
-        if np.any(pred):
-            return 0.0
-        # If masks are identical but empty, return 0
-        else:
-            return 0.0
-    
-    # Check if both arrays have positive values
-    if np.any(pred) and np.any(target):
-        try:
-            # Use medpy's implementation directly for more reliable results
-            try:
-                from medpy.metric.binary import hd95
-                return hd95(pred, target)
-            except Exception as e:
-                print(f"Error using medpy.metric.binary.hd95: {e}")
-                
-                # Fallback to our own implementation
-                # Generate binary structure for surface extraction
-                footprint = generate_binary_structure(pred.ndim, 1)
-                
-                # Extract surface voxels
-                pred_border = pred ^ binary_erosion(pred, structure=footprint, iterations=1)
-                target_border = target ^ binary_erosion(target, structure=footprint, iterations=1)
-                
-                # Check if borders are empty
-                if not np.any(pred_border) or not np.any(target_border):
-                    print("Warning: Empty borders detected in Hausdorff calculation")
-                    return 150.0
-                
-                # Compute distance transforms
-                dt_pred = distance_transform_edt(~pred_border)
-                dt_target = distance_transform_edt(~target_border)
-                
-                # Get surface distances in both directions
-                sds_pred = dt_target[pred_border]
-                sds_target = dt_pred[target_border]
-                
-                # Combine distances and calculate 95th percentile
-                all_distances = np.hstack((sds_pred, sds_target))
-                if len(all_distances) > 0:
-                    return np.percentile(all_distances, 95)
-                else:
-                    print("Warning: No distances calculated in Hausdorff distance")
-                    return 150.0  # Return high value if no distances calculated
-        except Exception as e:
-            print(f"Error calculating Hausdorff distance: {e}")
-            return 150.0  # Return high value on error
-    elif np.any(target):  # Ground truth has tumor but prediction doesn't
-        return 150.0  # Penalize with high value
-    elif np.any(pred):  # Prediction has tumor but ground truth doesn't
-        return 150.0  # Penalize with high value
-    else:  # Both are empty
-        return 0.0  # Both are empty, so distance is 0
+    try:
+        hd = compute_hausdorff_distance(pred, target, percentile=95)
+        return hd.item()
+    except Exception as e:
+        print(f"Error calculating Hausdorff distance: {e}")
+        return 150.0  # Return high value on error
 
 # Function to train the model
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, checkpoint_path):
@@ -447,6 +335,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     val_losses = []
     best_val_loss = float('inf')
     current_lr = optimizer.param_groups[0]['lr']
+    patience = 10  # Early stopping patience
+    patience_counter = 0
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    
+    # Set gradient clipping threshold
+    max_grad_norm = 1.0
     
     for epoch in range(num_epochs):
         # Training phase
@@ -460,17 +356,40 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             # Zero the gradients
             optimizer.zero_grad()
             
-            # Forward pass
-            outputs = model(images)
-            
-            # Calculate loss
-            loss = criterion(outputs, labels)
-            
-            # Backward pass and optimize
-            loss.backward()
-            optimizer.step()
+            # Mixed precision training
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                # Optimizer step with gradient scaling
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Regular training
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                optimizer.step()
             
             epoch_train_loss += loss.item()
+            
+            # Monitor memory usage and adjust batch size if needed
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**2  # Convert to MB
+                if memory_allocated > torch.cuda.get_device_properties(0).total_memory * 0.95 / 1024**2:
+                    print("\nWARNING: High memory usage detected. Consider reducing batch size.")
         
         # Calculate average training loss for this epoch
         epoch_train_loss /= len(train_loader)
@@ -486,10 +405,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 labels = labels.to(device)
                 
                 # Forward pass
-                outputs = model(images)
-                
-                # Calculate loss
-                loss = criterion(outputs, labels)
+                if scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        outputs = model(images)
+                        loss = criterion(outputs, labels)
+                else:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
                 
                 epoch_val_loss += loss.item()
         
@@ -509,9 +431,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         # Print epoch results
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}, LR: {current_lr:.6f}')
         
-        # Save the best model
+        # Early stopping check
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
+            patience_counter = 0
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -522,6 +445,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             }
             torch.save(checkpoint, checkpoint_path)
             print(f'Checkpoint saved at epoch {epoch+1} with validation loss {best_val_loss:.4f}')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'\nEarly stopping triggered after {epoch+1} epochs')
+                break
     
     # Load the best model
     checkpoint = torch.load(checkpoint_path)
@@ -547,26 +475,22 @@ def plot_losses(train_losses, val_losses, fold):
 def evaluate_model(model, test_loader):
     model.eval()
     
-    # Initialize metrics
-    dice_et = []
-    dice_tc = []
-    dice_wt = []
-    hd95_et = []
-    hd95_tc = []
-    hd95_wt = []
+    # Initialize MONAI metrics
+    dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=True)
+    hausdorff_metric = HausdorffDistanceMetric(include_background=False, reduction="mean", percentile=95, get_not_nans=True)
     
     # Store some examples for visualization
     examples = []
     
-    # Count slices with enhancing tumors
-    et_count = 0
-    et_pred_count = 0
-    
-    # Detailed ET statistics
-    et_pixel_counts_gt = []
-    et_pixel_counts_pred = []
-    et_perfect_matches = 0
-    et_zero_hd_count = 0
+    # Initialize metric accumulators
+    all_metrics = {
+        'dice_et': [],
+        'dice_tc': [],
+        'dice_wt': [],
+        'hd95_et': [],
+        'hd95_tc': [],
+        'hd95_wt': []
+    }
     
     with torch.no_grad():
         for images, labels, slice_idx in tqdm(test_loader, desc='Evaluating'):
@@ -575,125 +499,78 @@ def evaluate_model(model, test_loader):
             
             # Forward pass
             outputs = model(images)
+            outputs = torch.softmax(outputs, dim=1)
             
-            # Apply softmax to get probabilities
-            probs = torch.softmax(outputs, dim=1)
-            
-            # Get predictions
-            preds = torch.argmax(probs, dim=1)
-            
-            # Store a few examples for later visualization
+            # Store a few examples for visualization
             if len(examples) < 5:
-                examples.append((images.cpu(), labels.cpu(), preds.cpu(), slice_idx))
+                examples.append((images.cpu(), labels.cpu(), torch.argmax(outputs, dim=1).cpu(), slice_idx))
             
-            # Convert predictions to binary masks for each region
+            # Process each sample in the batch
             for i in range(images.size(0)):
-                # Ground truth - labels are already one-hot encoded
-                # Channel 0: background (label 0)
-                # Channel 1: necrotic and non-enhancing tumor (label 1)
-                # Channel 2: peritumoral edema (label 2)
-                # Channel 3: enhancing tumor (label 4)
-                gt_et = labels[i, 3].float()  # Enhancing tumor (label 4)
+                # Extract individual predictions and labels
+                pred = outputs[i:i+1]  # Keep batch dimension
+                label = labels[i:i+1]  # Keep batch dimension
                 
-                # For tumor core, combine necrotic and enhancing tumor using logical OR
-                # Convert to boolean, perform logical OR, then back to float
-                gt_tc = ((labels[i, 1] > 0.5) | (labels[i, 3] > 0.5)).float()  # Tumor core (labels 1 and 4)
+                # Create binary masks for each region
+                # Enhancing tumor (ET) - label 4
+                pred_et = (torch.argmax(pred, dim=1) == 3).float()
+                gt_et = (label[:, 3] > 0.5).float()
                 
-                # For whole tumor, combine all tumor classes
-                gt_wt = ((labels[i, 1] > 0.5) | (labels[i, 2] > 0.5) | (labels[i, 3] > 0.5)).float()  # Whole tumor (labels 1, 2, and 4)
+                # Tumor core (TC) - labels 1 and 4
+                pred_tc = ((torch.argmax(pred, dim=1) == 1) | (torch.argmax(pred, dim=1) == 3)).float()
+                gt_tc = ((label[:, 1] > 0.5) | (label[:, 3] > 0.5)).float()
                 
-                # Predictions - convert from class indices to binary masks
-                # preds has shape [batch_size, H, W] with values 0-3
-                # 0: background, 1: necrotic, 2: edema, 3: enhancing
-                pred_et = (preds[i] == 3).float()  # Enhancing tumor (index 3 for class 4)
-                pred_tc = ((preds[i] == 1) | (preds[i] == 3)).float()  # Tumor core (indices 1 and 3)
-                pred_wt = ((preds[i] == 1) | (preds[i] == 2) | (preds[i] == 3)).float()  # Whole tumor (indices 1, 2, and 3)
+                # Whole tumor (WT) - labels 1, 2, and 4
+                pred_wt = ((torch.argmax(pred, dim=1) > 0)).float()  # Any non-background
+                gt_wt = ((label[:, 1:] > 0.5).sum(dim=1) > 0).float()
                 
-                # Count slices with enhancing tumors
-                gt_et_pixels = torch.sum(gt_et).item()
-                pred_et_pixels = torch.sum(pred_et).item()
+                # Calculate metrics for each region
+                if torch.any(gt_et):
+                    dice_metric(pred_et.unsqueeze(1), gt_et.unsqueeze(1))
+                    hausdorff_metric(pred_et.unsqueeze(1), gt_et.unsqueeze(1))
+                    all_metrics['dice_et'].append(dice_metric.aggregate().item())
+                    all_metrics['hd95_et'].append(hausdorff_metric.aggregate().item())
                 
-                if gt_et_pixels > 0:
-                    et_count += 1
-                    et_pixel_counts_gt.append(gt_et_pixels)
-                
-                if pred_et_pixels > 0:
-                    et_pred_count += 1
-                    et_pixel_counts_pred.append(pred_et_pixels)
-                
-                # Check for perfect matches in ET
-                if gt_et_pixels > 0 and torch.all(gt_et == pred_et):
-                    et_perfect_matches += 1
-                
-                # Calculate Dice scores
-                dice_et.append(dice_score(pred_et, gt_et))
-                dice_tc.append(dice_score(pred_tc, gt_tc))
-                dice_wt.append(dice_score(pred_wt, gt_wt))
-                
-                # Calculate Hausdorff distances
-                # For enhancing tumor
-                if gt_et_pixels > 0:
-                    hd_et = hausdorff_distance(pred_et, gt_et)
-                    hd95_et.append(hd_et)
-                    
-                    # Count zero HD cases
-                    if hd_et == 0 and pred_et_pixels > 0:
-                        et_zero_hd_count += 1
-                        print(f"Warning: HD95_ET is 0 for a slice with ET present. GT pixels: {gt_et_pixels}, Pred pixels: {pred_et_pixels}")
-                        
-                        # Additional check: are the masks identical?
-                        if not torch.all(gt_et == pred_et):
-                            print(f"  Unusual: HD95=0 but masks are not identical. This suggests an issue with HD calculation.")
-                
-                # For tumor core
                 if torch.any(gt_tc):
-                    hd95_tc.append(hausdorff_distance(pred_tc, gt_tc))
+                    dice_metric(pred_tc.unsqueeze(1), gt_tc.unsqueeze(1))
+                    hausdorff_metric(pred_tc.unsqueeze(1), gt_tc.unsqueeze(1))
+                    all_metrics['dice_tc'].append(dice_metric.aggregate().item())
+                    all_metrics['hd95_tc'].append(hausdorff_metric.aggregate().item())
                 
-                # For whole tumor
                 if torch.any(gt_wt):
-                    hd95_wt.append(hausdorff_distance(pred_wt, gt_wt))
-    
-    # Print diagnostic information
-    print(f"\n===== ENHANCING TUMOR (ET) DIAGNOSTICS =====")
-    print(f"Total slices with ET in ground truth: {et_count}")
-    print(f"Total slices with ET in predictions: {et_pred_count}")
-    
-    if et_count > 0:
-        print(f"Average ET pixels per slice (ground truth): {np.mean(et_pixel_counts_gt):.2f}")
-    if et_pred_count > 0:
-        print(f"Average ET pixels per slice (prediction): {np.mean(et_pixel_counts_pred):.2f}")
-    
-    print(f"Perfect ET mask matches: {et_perfect_matches}")
-    print(f"Zero Hausdorff distance cases: {et_zero_hd_count}")
-    
-    # Added after some runs returned odd looking results
-    if et_zero_hd_count > 0 and et_perfect_matches < et_zero_hd_count:
-        print("WARNING: There are cases with zero Hausdorff distance but imperfect mask matches.")
-        print("This strongly suggests an issue with the Hausdorff distance calculation.")
+                    dice_metric(pred_wt.unsqueeze(1), gt_wt.unsqueeze(1))
+                    hausdorff_metric(pred_wt.unsqueeze(1), gt_wt.unsqueeze(1))
+                    all_metrics['dice_wt'].append(dice_metric.aggregate().item())
+                    all_metrics['hd95_wt'].append(hausdorff_metric.aggregate().item())
     
     # Calculate mean metrics
-    mean_dice_et = np.mean(dice_et) if dice_et else 0
-    mean_dice_tc = np.mean(dice_tc) if dice_tc else 0
-    mean_dice_wt = np.mean(dice_wt) if dice_wt else 0
+    results = {
+        'dice_et': np.mean(all_metrics['dice_et']) if all_metrics['dice_et'] else 0,
+        'dice_tc': np.mean(all_metrics['dice_tc']) if all_metrics['dice_tc'] else 0,
+        'dice_wt': np.mean(all_metrics['dice_wt']) if all_metrics['dice_wt'] else 0,
+        'hd95_et': np.mean(all_metrics['hd95_et']) if all_metrics['hd95_et'] else 0,
+        'hd95_tc': np.mean(all_metrics['hd95_tc']) if all_metrics['hd95_tc'] else 0,
+        'hd95_wt': np.mean(all_metrics['hd95_wt']) if all_metrics['hd95_wt'] else 0
+    }
     
-    mean_hd95_et = np.mean(hd95_et) if hd95_et else 0
-    mean_hd95_tc = np.mean(hd95_tc) if hd95_tc else 0
-    mean_hd95_wt = np.mean(hd95_wt) if hd95_wt else 0
+    # Print detailed metrics
+    print("\n===== EVALUATION METRICS =====")
+    print(f"Enhancing Tumor (ET):")
+    print(f"  - Dice Score: {results['dice_et']:.4f}")
+    print(f"  - HD95: {results['hd95_et']:.4f}")
+    print(f"  - Number of valid samples: {len(all_metrics['dice_et'])}")
     
-    # Print summary of metrics
-    print(f"\n===== METRICS SUMMARY =====")
-    print(f"ET metrics - Dice: {mean_dice_et:.4f}, HD95: {mean_hd95_et:.4f}, Samples: {len(hd95_et)}")
-    print(f"TC metrics - Dice: {mean_dice_tc:.4f}, HD95: {mean_hd95_tc:.4f}, Samples: {len(hd95_tc)}")
-    print(f"WT metrics - Dice: {mean_dice_wt:.4f}, HD95: {mean_hd95_wt:.4f}, Samples: {len(hd95_wt)}")
+    print(f"\nTumor Core (TC):")
+    print(f"  - Dice Score: {results['dice_tc']:.4f}")
+    print(f"  - HD95: {results['hd95_tc']:.4f}")
+    print(f"  - Number of valid samples: {len(all_metrics['dice_tc'])}")
     
-    return {
-        'dice_et': mean_dice_et,
-        'dice_tc': mean_dice_tc,
-        'dice_wt': mean_dice_wt,
-        'hd95_et': mean_hd95_et,
-        'hd95_tc': mean_hd95_tc,
-        'hd95_wt': mean_hd95_wt
-    }, examples
+    print(f"\nWhole Tumor (WT):")
+    print(f"  - Dice Score: {results['dice_wt']:.4f}")
+    print(f"  - HD95: {results['hd95_wt']:.4f}")
+    print(f"  - Number of valid samples: {len(all_metrics['dice_wt'])}")
+    
+    return results, examples
 
 # Function to visualize results
 def visualize_results(examples, fold, output_dir):
@@ -786,43 +663,6 @@ def visualize_results(examples, fold, output_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'visualizations', f'segmentation_results_fold{fold+1}.png'))
     plt.close()
-
-# Define data augmentation transforms
-def get_transforms():
-    """
-    Get data augmentation transforms for 2D slices.
-    
-    Returns:
-    --------
-    callable
-        A function that applies transforms to both image and label
-    """
-    def apply_transforms(image, label):
-        # Apply random rotation
-        if random.random() < 0.5:
-            angle = random.choice([0, 90, 180, 270])
-            image = torch.rot90(image, k=angle // 90, dims=[1, 2])
-            label = torch.rot90(label, k=angle // 90, dims=[1, 2])
-        
-        # Apply random horizontal flip
-        if random.random() < 0.5:
-            image = torch.flip(image, dims=[2])
-            label = torch.flip(label, dims=[2])
-        
-        # Apply random vertical flip
-        if random.random() < 0.5:
-            image = torch.flip(image, dims=[1])
-            label = torch.flip(label, dims=[1])
-        
-        # Apply random brightness adjustment
-        if random.random() < 0.5:
-            brightness_factor = random.uniform(0.8, 1.2)
-            image = image * brightness_factor
-            image = torch.clamp(image, 0, 1)
-        
-        return image, label
-    
-    return apply_transforms
 
 # Function to analyze dataset for enhancing tumor regions
 def analyze_dataset_et(data_loader):
@@ -940,9 +780,6 @@ def main():
         'hd95_wt': []
     }
     
-    # Define transformations
-    transform = get_transforms()
-    
     # Loop through each fold
     for fold, (train_idx, val_idx) in enumerate(kf.split(image_files)):
         print(f"\nTraining fold {fold+1}/5")
@@ -953,9 +790,9 @@ def main():
         val_img_files = [image_files[i] for i in val_idx]
         val_label_files = [label_files[i] for i in val_idx]
         
-        # Create datasets
-        train_dataset = BrainTumorDataset(train_img_files, train_label_files, transform=transform)
-        val_dataset = BrainTumorDataset(val_img_files, val_label_files)
+        # Create datasets with transforms
+        train_dataset = BrainTumorDataset(train_img_files, train_label_files, transform=True)  # Enable augmentation for training
+        val_dataset = BrainTumorDataset(val_img_files, val_label_files, transform=False)  # No augmentation for validation
         
         # Check if datasets have data
         if len(train_dataset) == 0:
@@ -1003,12 +840,18 @@ def main():
             except Exception as e:
                 print(f"Error during dataset analysis: {e}")
         
-        # Initialize model
-        model = UNet(in_channels=4, out_channels=4).to(device)
+        # Initialize model using MONAI's UNet
+        model = MonaiUNet(
+            spatial_dims=2,
+            in_channels=4,
+            out_channels=4,
+            channels=(64, 128, 256, 512, 1024),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        ).to(device)
         
-        # Define loss function with class weights
-        class_weights = torch.tensor([0.1, 0.3, 0.3, 0.3]).to(device)  # Lower weight for background
-        criterion = DiceLoss(weight=class_weights)
+        # Use MONAI's DiceCELoss instead of custom DiceLoss
+        criterion = DiceCELoss(to_onehot_y=True, softmax=True)
         
         # Define optimizer and scheduler
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
