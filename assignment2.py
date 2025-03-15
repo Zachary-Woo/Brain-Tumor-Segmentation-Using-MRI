@@ -41,7 +41,6 @@
 
 # Import necessary libraries
 import os
-import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import nibabel as nib
@@ -667,6 +666,7 @@ def evaluate_model(model, test_loader):
     print(f"Perfect ET mask matches: {et_perfect_matches}")
     print(f"Zero Hausdorff distance cases: {et_zero_hd_count}")
     
+    # Added after some runs returned odd looking results
     if et_zero_hd_count > 0 and et_perfect_matches < et_zero_hd_count:
         print("WARNING: There are cases with zero Hausdorff distance but imperfect mask matches.")
         print("This strongly suggests an issue with the Hausdorff distance calculation.")
@@ -841,7 +841,7 @@ def analyze_dataset_et(data_loader):
     et_pixel_counts = []
     et_pixel_percentages = []
     
-    for images, labels, slice_idx in tqdm(data_loader, desc='Analyzing dataset'):
+    for images, labels in tqdm(data_loader, desc='Analyzing dataset'):
         total_slices += images.size(0)
         
         for i in range(images.size(0)):
