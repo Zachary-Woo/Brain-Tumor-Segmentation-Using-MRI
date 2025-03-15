@@ -75,6 +75,8 @@ np.random.seed(42)
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
+    # Enable benchmark mode for faster training
+    torch.backends.cudnn.benchmark = True
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -227,6 +229,8 @@ class BrainTumorDataset(Dataset):
         try:
             total_slices = 0
             tumor_slices = 0
+            et_slices = 0  # Count slices with enhancing tumor
+            
             # Add tqdm progress bar for volume processing
             for i in tqdm(range(len(self.dataset)), desc="Processing volumes"):
                 volume = self.dataset[i]
@@ -245,6 +249,15 @@ class BrainTumorDataset(Dataset):
                     print(f"Warning: Non-tensor data at index {i}. Image: {type(img_volume)}, Label: {type(lbl_volume)}")
                     continue
                 
+                # Debug: Check for enhancing tumor in this volume
+                has_et = torch.any(lbl_volume == 4).item()
+                if has_et and i < 5:  # Only print for first few volumes
+                    print(f"Volume {i} contains enhancing tumor (label 4)")
+                    # Count how many voxels have enhancing tumor
+                    et_voxels = torch.sum(lbl_volume == 4).item()
+                    total_voxels = lbl_volume.numel()
+                    print(f"  - ET voxels: {et_voxels} ({100 * et_voxels / total_voxels:.4f}% of volume)")
+                
                 # Extract 2D slices along the z-axis
                 slices_z = img_volume.shape[-1]
                 middle_start = max(0, (slices_z // 2) - 20)  # Focus on middle slices where tumor is likely
@@ -253,6 +266,7 @@ class BrainTumorDataset(Dataset):
                 # Store info about slices processed
                 volume_slices = 0
                 volume_tumor_slices = 0
+                volume_et_slices = 0
                 
                 # Store central slices (more likely to contain tumor)
                 for z in range(middle_start, middle_end):
@@ -260,6 +274,11 @@ class BrainTumorDataset(Dataset):
                     lbl_slice = lbl_volume[..., z]
                     
                     volume_slices += 1
+                    
+                    # Check for enhancing tumor in this slice
+                    has_et_slice = torch.any(lbl_slice == 4).item()
+                    if has_et_slice:
+                        volume_et_slices += 1
                     
                     # Skip slices without any tumor
                     has_tumor = torch.sum(lbl_slice > 0).item() >= 10
@@ -280,10 +299,12 @@ class BrainTumorDataset(Dataset):
                 # Update total counters
                 total_slices += volume_slices
                 tumor_slices += volume_tumor_slices
+                et_slices += volume_et_slices
             
             # Print summary statistics
             print(f"Processed {len(self.dataset)} volumes with {total_slices} total slices")
             print(f"Found {tumor_slices} slices containing tumor ({100 * tumor_slices / max(total_slices, 1):.2f}%)")
+            print(f"Found {et_slices} slices containing enhancing tumor ({100 * et_slices / max(total_slices, 1):.2f}%)")
             print(f"Created dataset with {len(self.all_slices)} 2D slices after filtering")
             
             # Visualize a few sample slices
@@ -397,6 +418,13 @@ class BrainTumorDataset(Dataset):
                 print(f"Warning: Label is not a tensor at index {idx}")
                 label = torch.zeros((1, *self.target_size), dtype=torch.float32)
             
+            # Debug: Check for enhancing tumor in this slice
+            has_et = torch.any(label == 4).item()
+            if has_et and idx < 10:  # Only print for first few slices
+                et_pixels = torch.sum(label == 4).item()
+                total_pixels = label.numel()
+                print(f"Slice {idx} contains enhancing tumor (label 4): {et_pixels} pixels ({100 * et_pixels / total_pixels:.4f}%)")
+            
             # Create one-hot encoding for segmentation
             # Convert label to one-hot encoding: background (0), necrotic (1), edema (2), enhancing (4)
             one_hot = torch.zeros((4, *label.shape[1:]), dtype=torch.float32)
@@ -406,6 +434,11 @@ class BrainTumorDataset(Dataset):
             one_hot[1] = (label[0] == 1).float()  # Necrotic and non-enhancing tumor
             one_hot[2] = (label[0] == 2).float()  # Peritumoral edema
             one_hot[3] = (label[0] == 4).float()  # GD-enhancing tumor
+            
+            # Debug: Check if one-hot encoding preserved enhancing tumor
+            if has_et and idx < 10:
+                et_pixels_onehot = torch.sum(one_hot[3]).item()
+                print(f"  - After one-hot encoding: {et_pixels_onehot} pixels")
             
             # Make sure sizes are consistent - resize if needed
             if image.shape[1:] != one_hot.shape[1:]:
@@ -534,8 +567,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     patience = 10  # Early stopping patience
     patience_counter = 0
     
-    # Initialize gradient scaler for mixed precision training
-    scaler = torch.amp.GradScaler() if torch.cuda.is_available() else None
+    # Initialize gradient scaler for mixed precision training with explicit enabled=True
+    scaler = torch.amp.GradScaler(enabled=True) if torch.cuda.is_available() else None
     
     # Set gradient clipping threshold
     max_grad_norm = 1.0
@@ -578,9 +611,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             optimizer.zero_grad()
             
             try:
-                # Mixed precision training
+                # Mixed precision training with explicit dtype
                 if scaler is not None:
-                    with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                         outputs = model(images)
                         loss = criterion(outputs, labels)
                         
@@ -1128,10 +1161,10 @@ def main():
             break
         print("Invalid choice. Please enter 'train' or 'pretrained'.")
     
-    # Set hyperparameters
-    batch_size = 4  # Reduced batch size to save memory
+    # Set hyperparameters - increased for RTX 4090
+    batch_size = 16  # Increased from 4 to 16
     num_epochs = 10
-    learning_rate = 0.0005  # Reduced learning rate for stability
+    learning_rate = 0.001  # Increased from 0.0005 to 0.001
     
     # Define paths
     data_dir = 'Task01_BrainTumour'
@@ -1200,8 +1233,8 @@ def main():
         # Create datasets with transforms
         try:
             print("Creating training dataset...")
-            # Use smaller target size to save memory
-            target_size = (128, 128)
+            # Use higher resolution for RTX 4090
+            target_size = (240, 240)  # Increased from (128, 128)
             train_dataset = BrainTumorDataset(train_img_files, train_label_files, transform=True, resize=True, target_size=target_size)
             print("Training dataset created successfully")
             
@@ -1230,22 +1263,22 @@ def main():
                 except Exception as e:
                     print(f"Error loading sample {i}: {e}")
             
-            # Create data loaders with memory-efficient settings
+            # Create data loaders with optimized settings for RTX 4090
             print("Creating data loaders...")
             train_loader = DataLoader(
                 train_dataset, 
                 batch_size=batch_size, 
                 shuffle=True, 
-                num_workers=0,  # No parallel workers to save memory
-                pin_memory=False  # Don't pin memory
+                num_workers=4,  # Increased from 0 to 4 for parallel loading
+                pin_memory=True  # Enabled pinned memory for faster transfers
             )
             
             val_loader = DataLoader(
                 val_dataset, 
                 batch_size=batch_size, 
                 shuffle=False, 
-                num_workers=0,
-                pin_memory=False
+                num_workers=4,  # Increased from 0 to 4
+                pin_memory=True  # Enabled pinned memory
             )
             print("Data loaders created successfully")
             
@@ -1272,16 +1305,16 @@ def main():
             except Exception as e:
                 print(f"Error during dataset analysis: {e}")
         
-        # Initialize model using MONAI's UNet
+        # Initialize model using MONAI's UNet with larger architecture for RTX 4090
         model = MonaiUNet(
             spatial_dims=2,
             in_channels=4,
             out_channels=4,
-            channels=(16, 32, 64, 128),  # Smaller architecture to prevent overfitting
-            strides=(2, 2, 2),
+            channels=(32, 64, 128, 256, 512),  # Larger architecture for RTX 4090
+            strides=(2, 2, 2, 2),
             num_res_units=2,
-            norm='BATCH',  # Add batch normalization
-            dropout=0.2,   # Add dropout for regularization
+            norm='BATCH',
+            dropout=0.2,
         ).to(device)
         
         # Initialize weights properly to prevent NaN issues
@@ -1294,25 +1327,23 @@ def main():
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
         
-        # Use MONAI's DiceCELoss with to_onehot_y=False since our labels are already one-hot encoded
-        # Use a higher weight for CE loss to stabilize training
+        # Use MONAI's DiceCELoss with optimized parameters
         criterion = DiceCELoss(
             to_onehot_y=False, 
-            softmax=True, 
-            lambda_ce=0.8,  # Higher weight for CE loss
-            lambda_dice=0.2,  # Lower weight for Dice loss
-            smooth_nr=1e-5,  # Increase smoothing factor
-            smooth_dr=1e-5
+            softmax=True,
+            smooth_nr=1e-5,
+            smooth_dr=1e-5,
+            batch=True  # Enable batch processing
         )
         
-        # Define optimizer and scheduler with lower learning rate
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)  # Add weight decay
+        # Define optimizer and scheduler with adjusted learning rate
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)  # Changed from Adam to AdamW
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='min', 
-            factor=0.2,  # Larger reduction factor
-            patience=5,   # More patience
-            min_lr=1e-6   # Set minimum learning rate
+            factor=0.2,
+            patience=5,
+            min_lr=1e-6
         )
         
         # Define checkpoint path
