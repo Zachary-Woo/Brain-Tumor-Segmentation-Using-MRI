@@ -212,7 +212,7 @@ class BrainTumorDataset(Dataset):
                 RandCropByPosNegLabeld(
                     keys=["image", "label"],
                     label_key="label",
-                    spatial_size=(240, 240, 1),  # Changed to 3D size to satisfy the MONAI 3D requirement
+                    spatial_size=(128, 128, 1),  # Changed from 240x240 to 128x128
                     pos=1,
                     neg=1,
                     num_samples=4,
