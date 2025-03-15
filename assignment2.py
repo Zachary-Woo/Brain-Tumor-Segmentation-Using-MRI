@@ -212,7 +212,7 @@ class BrainTumorDataset(Dataset):
                 RandCropByPosNegLabeld(
                     keys=["image", "label"],
                     label_key="label",
-                    spatial_size=(240, 240),
+                    spatial_size=(240, 240, 1),  # Changed to 3D size to satisfy the MONAI 3D requirement
                     pos=1,
                     neg=1,
                     num_samples=4,
@@ -728,7 +728,7 @@ def main():
     
     # Define paths
     data_dir = 'Task01_BrainTumour'
-    output_dir = 'results_2d_unet'
+    output_dir = 'results_v3'
     
     # Create output directories
     print(f"Creating output directories in {output_dir}")
