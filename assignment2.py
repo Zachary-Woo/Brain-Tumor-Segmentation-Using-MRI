@@ -749,20 +749,41 @@ def evaluate_model(model, test_loader):
                 if torch.any(gt_et):
                     dice_metric(pred_et.unsqueeze(1), gt_et.unsqueeze(1))
                     hausdorff_metric(pred_et.unsqueeze(1), gt_et.unsqueeze(1))
-                    all_metrics['dice_et'].append(dice_metric.aggregate().item())
-                    all_metrics['hd95_et'].append(hausdorff_metric.aggregate().item())
+                    
+                    # Safely extract metric values
+                    dice_result = dice_metric.aggregate()
+                    if isinstance(dice_result, (int, float)) or (hasattr(dice_result, "item") and callable(getattr(dice_result, "item"))):
+                        all_metrics['dice_et'].append(dice_result.item() if hasattr(dice_result, "item") else dice_result)
+                    
+                    hd_result = hausdorff_metric.aggregate()
+                    if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
+                        all_metrics['hd95_et'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
                 
                 if torch.any(gt_tc):
                     dice_metric(pred_tc.unsqueeze(1), gt_tc.unsqueeze(1))
                     hausdorff_metric(pred_tc.unsqueeze(1), gt_tc.unsqueeze(1))
-                    all_metrics['dice_tc'].append(dice_metric.aggregate().item())
-                    all_metrics['hd95_tc'].append(hausdorff_metric.aggregate().item())
+                    
+                    # Safely extract metric values
+                    dice_result = dice_metric.aggregate()
+                    if isinstance(dice_result, (int, float)) or (hasattr(dice_result, "item") and callable(getattr(dice_result, "item"))):
+                        all_metrics['dice_tc'].append(dice_result.item() if hasattr(dice_result, "item") else dice_result)
+                    
+                    hd_result = hausdorff_metric.aggregate()
+                    if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
+                        all_metrics['hd95_tc'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
                 
                 if torch.any(gt_wt):
                     dice_metric(pred_wt.unsqueeze(1), gt_wt.unsqueeze(1))
                     hausdorff_metric(pred_wt.unsqueeze(1), gt_wt.unsqueeze(1))
-                    all_metrics['dice_wt'].append(dice_metric.aggregate().item())
-                    all_metrics['hd95_wt'].append(hausdorff_metric.aggregate().item())
+                    
+                    # Safely extract metric values
+                    dice_result = dice_metric.aggregate()
+                    if isinstance(dice_result, (int, float)) or (hasattr(dice_result, "item") and callable(getattr(dice_result, "item"))):
+                        all_metrics['dice_wt'].append(dice_result.item() if hasattr(dice_result, "item") else dice_result)
+                    
+                    hd_result = hausdorff_metric.aggregate()
+                    if isinstance(hd_result, (int, float)) or (hasattr(hd_result, "item") and callable(getattr(hd_result, "item"))):
+                        all_metrics['hd95_wt'].append(hd_result.item() if hasattr(hd_result, "item") else hd_result)
     
     # Calculate mean metrics
     results = {
