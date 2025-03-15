@@ -192,38 +192,23 @@ class UNet(nn.Module):
 
 # Define the dataset class
 class BrainTumorDataset(Dataset):
-    def __init__(self, image_files, label_files, transform=None):
+    def __init__(self, image_files, label_files, transform=None, resize=True, target_size=(240, 240)):
         self.image_files = [os.path.join(images_dir, f) for f in image_files]
         self.label_files = [os.path.join(labels_dir, f) for f in label_files]
+        self.resize = resize
+        self.target_size = target_size
+        self.visualize_samples = True  # Flag to control visualization
         
-        # Define base MONAI transforms for both training and validation
+        # Define simplified transforms for loading and preprocessing 3D data
         base_transforms = [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
-            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
             NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
-            CropForegroundd(keys=["image", "label"], source_key="image"),
             EnsureTyped(keys=["image", "label"]),
         ]
         
-        if transform:  # Add data augmentation transforms during training
-            train_transforms = [
-                RandCropByPosNegLabeld(
-                    keys=["image", "label"],
-                    label_key="label",
-                    spatial_size=(128, 128, 1),  # Changed from 240x240 to 128x128
-                    pos=1,
-                    neg=1,
-                    num_samples=4,
-                ),
-                RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(0, 1)),  # Specify 2D rotation axes
-                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),  # Only flip along one axis
-            ]
-            # Removed RandZoomd which was causing issues
-            self.transform = Compose(base_transforms + train_transforms)
-        else:
-            self.transform = Compose(base_transforms)
+        # We'll apply simpler transforms before slicing the data to 2D
+        self.transform = Compose(base_transforms)
         
         # Create data list for MONAI dataset
         self.data_dicts = [
@@ -231,49 +216,239 @@ class BrainTumorDataset(Dataset):
             for image_file, label_file in zip(self.image_files, self.label_files)
         ]
         
-        # Initialize MONAI dataset
+        # Initialize MONAI dataset with simpler transforms
         self.dataset = MonaiDataset(self.data_dicts, transform=self.transform)
         
+        # Store slices for all volumes to create a flat dataset
+        self.all_slices = []
+        
+        # Pre-process datasets to extract 2D slices from 3D volumes
+        print("Extracting 2D slices from 3D volumes...")
+        try:
+            total_slices = 0
+            tumor_slices = 0
+            # Add tqdm progress bar for volume processing
+            for i in tqdm(range(len(self.dataset)), desc="Processing volumes"):
+                volume = self.dataset[i]
+                
+                # Ensure we have a dictionary output
+                if not isinstance(volume, dict):
+                    print(f"Warning: Expected dict but got {type(volume)} at index {i}")
+                    continue
+                
+                # Get 3D volumes
+                img_volume = volume["image"]
+                lbl_volume = volume["label"]
+                
+                # Check that we have proper tensors
+                if not isinstance(img_volume, torch.Tensor) or not isinstance(lbl_volume, torch.Tensor):
+                    print(f"Warning: Non-tensor data at index {i}. Image: {type(img_volume)}, Label: {type(lbl_volume)}")
+                    continue
+                
+                # Extract 2D slices along the z-axis
+                slices_z = img_volume.shape[-1]
+                middle_start = max(0, (slices_z // 2) - 20)  # Focus on middle slices where tumor is likely
+                middle_end = min(slices_z, (slices_z // 2) + 20)
+                
+                # Store info about slices processed
+                volume_slices = 0
+                volume_tumor_slices = 0
+                
+                # Store central slices (more likely to contain tumor)
+                for z in range(middle_start, middle_end):
+                    img_slice = img_volume[..., z]
+                    lbl_slice = lbl_volume[..., z]
+                    
+                    volume_slices += 1
+                    
+                    # Skip slices without any tumor
+                    has_tumor = torch.sum(lbl_slice > 0).item() >= 10
+                    if transform and not has_tumor:
+                        continue  # Skip slices with little or no tumor during training
+                    
+                    if has_tumor:
+                        volume_tumor_slices += 1
+                        
+                    # Resize slices if requested to save memory
+                    if self.resize:
+                        img_slice = self._resize_slice(img_slice, self.target_size)
+                        lbl_slice = self._resize_slice(lbl_slice, self.target_size)
+                    
+                    # Store the slice
+                    self.all_slices.append((img_slice, lbl_slice, z))
+                
+                # Update total counters
+                total_slices += volume_slices
+                tumor_slices += volume_tumor_slices
+            
+            # Print summary statistics
+            print(f"Processed {len(self.dataset)} volumes with {total_slices} total slices")
+            print(f"Found {tumor_slices} slices containing tumor ({100 * tumor_slices / max(total_slices, 1):.2f}%)")
+            print(f"Created dataset with {len(self.all_slices)} 2D slices after filtering")
+            
+            # Visualize a few sample slices
+            if self.visualize_samples and len(self.all_slices) > 0:
+                self._visualize_sample_slices(5)  # Show 5 samples
+        except Exception as e:
+            print(f"Error preprocessing dataset: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Debug: Check the first few slices
+        if len(self.all_slices) > 0:
+            print(f"===== DATASET DEBUG INFO =====")
+            for i in range(min(3, len(self.all_slices))):
+                img, lbl, idx = self.all_slices[i]
+                print(f"Slice {i} - Image shape: {img.shape}, Label shape: {lbl.shape}, Slice index: {idx}")
+            print("================================")
+    
+    def _resize_slice(self, slice_tensor, target_size):
+        """Resize a 2D slice to the target size."""
+        # Get the original size
+        orig_size = slice_tensor.shape[1:]
+        channels = slice_tensor.shape[0]
+        
+        # If already the right size, return
+        if orig_size[0] == target_size[0] and orig_size[1] == target_size[1]:
+            return slice_tensor
+        
+        # Do a simple resize (interpolate for image, nearest neighbor for mask)
+        resized = torch.zeros((channels, target_size[0], target_size[1]), dtype=slice_tensor.dtype)
+        
+        # Simple center crop or pad
+        if orig_size[0] > target_size[0] or orig_size[1] > target_size[1]:
+            # Crop (take center)
+            start_x = (orig_size[0] - target_size[0]) // 2
+            start_y = (orig_size[1] - target_size[1]) // 2
+            resized = slice_tensor[:, start_x:start_x+target_size[0], start_y:start_y+target_size[1]]
+        else:
+            # Pad (add borders)
+            start_x = (target_size[0] - orig_size[0]) // 2
+            start_y = (target_size[1] - orig_size[1]) // 2
+            resized[:, start_x:start_x+orig_size[0], start_y:start_y+orig_size[1]] = slice_tensor
+        
+        return resized
+    
+    def _visualize_sample_slices(self, num_samples=5):
+        """Visualize sample slices to help with debugging."""
+        try:
+            # Get a few random samples to visualize
+            indices = np.random.choice(len(self.all_slices), min(num_samples, len(self.all_slices)), replace=False)
+            
+            plt.figure(figsize=(15, 3 * len(indices)))
+            plt.suptitle("Sample 2D Slices (Image and Segmentation Overlay)", fontsize=16)
+            
+            for i, idx in enumerate(indices):
+                img, lbl, slice_idx = self.all_slices[idx]
+                
+                # Extract the image (use the first modality for visualization)
+                img_display = img[0].numpy()
+                
+                # Create RGB segmentation overlay
+                lbl_overlay = np.zeros((*img_display.shape, 3))
+                
+                # Extract segmentation masks for different tumor regions
+                # Create one-hot encoding
+                background = (lbl[0] == 0).float().numpy()
+                necrotic = (lbl[0] == 1).float().numpy()
+                edema = (lbl[0] == 2).float().numpy()
+                enhancing = (lbl[0] == 4).float().numpy()
+                
+                # Add colors: red=enhancing, green=edema, blue=necrotic
+                lbl_overlay[..., 0] = enhancing * 1.0  # Red for enhancing
+                lbl_overlay[..., 1] = edema * 1.0      # Green for edema
+                lbl_overlay[..., 2] = necrotic * 1.0   # Blue for necrotic
+                
+                # Create two subplots side by side
+                plt.subplot(len(indices), 2, i*2 + 1)
+                plt.imshow(img_display, cmap='gray')
+                plt.title(f"Image (Slice {slice_idx})")
+                plt.axis('off')
+                
+                plt.subplot(len(indices), 2, i*2 + 2)
+                plt.imshow(img_display, cmap='gray')
+                plt.imshow(lbl_overlay, alpha=0.5)
+                plt.title(f"Segmentation Overlay")
+                plt.axis('off')
+            
+            plt.tight_layout()
+            plt.subplots_adjust(top=0.9)
+            plt.savefig('sample_slices.png')
+            print(f"Sample slices visualization saved to 'sample_slices.png'")
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error visualizing sample slices: {e}")
+    
     def __len__(self):
-        return len(self.dataset)
+        return len(self.all_slices)
     
     def __getitem__(self, idx):
-        data = self.dataset[idx]
-        
-        # Check if data is a list or a dictionary
-        if isinstance(data, list):
-            # If it's a list, assume first item is image, second is label
-            image = data[0]
-            label = data[1]
-        else:
-            # If it's a dictionary (as expected), extract image and label
-            image = data["image"]
-            label = data["label"]
-        
-        # Process the label to create one-hot encoding
-        label_tensor = label.squeeze(0)  # Remove channel dimension
-        
-        # Handle the case where the label has a third dimension of size 1
-        if label_tensor.dim() == 3 and label_tensor.shape[2] == 1:
-            label_tensor = label_tensor.squeeze(2)  # Remove the third dimension
+        try:
+            # Get pre-extracted 2D slice
+            image, label, slice_idx = self.all_slices[idx]
             
-        # Create one-hot encoding
-        one_hot = torch.zeros((4, *label_tensor.shape), dtype=torch.float32)
-        
-        # Background (class 0)
-        one_hot[0] = (label_tensor == 0).float()
-        # Necrotic and non-enhancing tumor (class 1)
-        one_hot[1] = (label_tensor == 1).float()
-        # Peritumoral edema (class 2)
-        one_hot[2] = (label_tensor == 2).float()
-        # GD-enhancing tumor (class 4, mapped to index 3)
-        one_hot[3] = (label_tensor == 4).float()
-        
-        # Handle the case where the image has a third dimension of size 1
-        if image.dim() == 4 and image.shape[3] == 1:
-            image = image.squeeze(3)  # Remove the third dimension
+            # Make sure we have proper tensor types
+            if not isinstance(image, torch.Tensor):
+                print(f"Warning: Image is not a tensor at index {idx}")
+                image = torch.zeros((4, *self.target_size), dtype=torch.float32)
             
-        return image, one_hot, idx
+            if not isinstance(label, torch.Tensor):
+                print(f"Warning: Label is not a tensor at index {idx}")
+                label = torch.zeros((1, *self.target_size), dtype=torch.float32)
+            
+            # Create one-hot encoding for segmentation
+            # Convert label to one-hot encoding: background (0), necrotic (1), edema (2), enhancing (4)
+            one_hot = torch.zeros((4, *label.shape[1:]), dtype=torch.float32)
+            
+            # Extract specific classes
+            one_hot[0] = (label[0] == 0).float()  # Background
+            one_hot[1] = (label[0] == 1).float()  # Necrotic and non-enhancing tumor
+            one_hot[2] = (label[0] == 2).float()  # Peritumoral edema
+            one_hot[3] = (label[0] == 4).float()  # GD-enhancing tumor
+            
+            # Make sure sizes are consistent - resize if needed
+            if image.shape[1:] != one_hot.shape[1:]:
+                # Resize by center cropping or padding to match target size
+                target_size = self.target_size
+                
+                # For image
+                if image.shape[1] > target_size[0] or image.shape[2] > target_size[1]:
+                    # Center crop
+                    start_x = (image.shape[1] - target_size[0]) // 2
+                    start_y = (image.shape[2] - target_size[1]) // 2
+                    image = image[:, start_x:start_x+target_size[0], start_y:start_y+target_size[1]]
+                elif image.shape[1] < target_size[0] or image.shape[2] < target_size[1]:
+                    # Pad
+                    new_image = torch.zeros((image.shape[0], *target_size), dtype=image.dtype)
+                    start_x = (target_size[0] - image.shape[1]) // 2
+                    start_y = (target_size[1] - image.shape[2]) // 2
+                    new_image[:, start_x:start_x+image.shape[1], start_y:start_y+image.shape[2]] = image
+                    image = new_image
+                
+                # For one_hot
+                if one_hot.shape[1] > target_size[0] or one_hot.shape[2] > target_size[1]:
+                    # Center crop
+                    start_x = (one_hot.shape[1] - target_size[0]) // 2
+                    start_y = (one_hot.shape[2] - target_size[1]) // 2
+                    one_hot = one_hot[:, start_x:start_x+target_size[0], start_y:start_y+target_size[1]]
+                elif one_hot.shape[1] < target_size[0] or one_hot.shape[2] < target_size[1]:
+                    # Pad
+                    new_one_hot = torch.zeros((one_hot.shape[0], *target_size), dtype=one_hot.dtype)
+                    start_x = (target_size[0] - one_hot.shape[1]) // 2
+                    start_y = (target_size[1] - one_hot.shape[2]) // 2
+                    new_one_hot[:, start_x:start_x+one_hot.shape[1], start_y:start_y+one_hot.shape[2]] = one_hot
+                    one_hot = new_one_hot
+            
+            return image, one_hot, slice_idx
+            
+        except Exception as e:
+            print(f"Error in __getitem__ at index {idx}: {e}")
+            # Return a default tensor in case of error
+            dummy_image = torch.zeros((4, *self.target_size), dtype=torch.float32)
+            dummy_label = torch.zeros((4, *self.target_size), dtype=torch.float32)
+            dummy_label[0] = 1.0  # All background
+            return dummy_image, dummy_label, 0
 
 # Function to calculate Dice score
 def dice_score(pred, target, smooth=1e-6):
@@ -878,43 +1053,68 @@ def main():
         val_label_files = [label_files[i] for i in val_idx]
         
         # Create datasets with transforms
-        train_dataset = BrainTumorDataset(train_img_files, train_label_files, transform=True)  # Enable augmentation for training
-        val_dataset = BrainTumorDataset(val_img_files, val_label_files, transform=False)  # No augmentation for validation
-        
-        # Check if datasets have data
-        if len(train_dataset) == 0:
-            print("ERROR: Training dataset is empty. Cannot proceed with training.")
+        try:
+            print("Creating training dataset...")
+            # Use smaller target size to save memory
+            target_size = (128, 128)
+            train_dataset = BrainTumorDataset(train_img_files, train_label_files, transform=True, resize=True, target_size=target_size)
+            print("Training dataset created successfully")
+            
+            print("Creating validation dataset...")
+            val_dataset = BrainTumorDataset(val_img_files, val_label_files, transform=False, resize=True, target_size=target_size)
+            print("Validation dataset created successfully")
+            
+            # Check if datasets have data
+            if len(train_dataset) == 0:
+                print("ERROR: Training dataset is empty. Cannot proceed with training.")
+                continue
+            
+            if len(val_dataset) == 0:
+                print("ERROR: Validation dataset is empty. Cannot proceed with training.")
+                continue
+            
+            print(f"Training dataset size: {len(train_dataset)} slices")
+            print(f"Validation dataset size: {len(val_dataset)} slices")
+            
+            # Test loading a few samples to verify the dataset works
+            print("Testing dataset sample loading...")
+            for i in range(min(3, len(train_dataset))):
+                try:
+                    sample = train_dataset[i]
+                    print(f"Sample {i} loaded successfully. Image shape: {sample[0].shape}, Label shape: {sample[1].shape}")
+                except Exception as e:
+                    print(f"Error loading sample {i}: {e}")
+            
+            # Create data loaders with memory-efficient settings
+            print("Creating data loaders...")
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=batch_size, 
+                shuffle=True, 
+                num_workers=0,  # No parallel workers to save memory
+                pin_memory=False  # Don't pin memory
+            )
+            
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=batch_size, 
+                shuffle=False, 
+                num_workers=0,
+                pin_memory=False
+            )
+            print("Data loaders created successfully")
+            
+            # Try to free up memory
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Error creating datasets for fold {fold+1}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
-        
-        if len(val_dataset) == 0:
-            print("ERROR: Validation dataset is empty. Cannot proceed with training.")
-            continue
-        
-        print(f"Training dataset size: {len(train_dataset)} slices")
-        print(f"Validation dataset size: {len(val_dataset)} slices")
-        
-        # Create data loaders with memory-efficient settings
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
-            num_workers=0,  # No parallel workers to save memory
-            pin_memory=False  # Don't pin memory
-        )
-        
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size, 
-            shuffle=False, 
-            num_workers=0,
-            pin_memory=False
-        )
-        
-        # Try to free up memory
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         
         # Analyze dataset for enhancing tumor regions
         if fold == 0:  # Only do this for the first fold to save time
@@ -937,8 +1137,8 @@ def main():
             num_res_units=2,
         ).to(device)
         
-        # Use MONAI's DiceCELoss instead of custom DiceLoss
-        criterion = DiceCELoss(to_onehot_y=True, softmax=True)
+        # Use MONAI's DiceCELoss with to_onehot_y=False since our labels are already one-hot encoded
+        criterion = DiceCELoss(to_onehot_y=False, softmax=True)
         
         # Define optimizer and scheduler
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
